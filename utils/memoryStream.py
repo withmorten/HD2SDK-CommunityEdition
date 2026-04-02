@@ -29,6 +29,12 @@ class MemoryStream:
         return not self.reading
 
     def seek(self, Location): # Go To Position In Stream
+        # Guard against invalid/sentinel offsets (e.g., 0xFFFFFFFFFFFFFFFF)
+        # which would cause memory overflow when trying to extend buffer
+        MAX_REASONABLE_SIZE = 1 << 32  # 4GB max, should be more than enough
+        if Location > MAX_REASONABLE_SIZE:
+            raise ValueError(f"Invalid seek offset {Location:#x} (exceeds {MAX_REASONABLE_SIZE:#x}). "
+                           "This may indicate corrupted data or an unsupported file format.")
         self.Location = Location
         if self.Location > len(self.Data):
             missing_bytes = self.Location - len(self.Data)

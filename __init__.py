@@ -30,7 +30,7 @@ import importlib
 # Blender
 import bpy
 from bpy_extras.io_utils import ImportHelper, ExportHelper
-from bpy.props import StringProperty, BoolProperty, IntProperty, EnumProperty, PointerProperty, CollectionProperty, FloatProperty
+from bpy.props import StringProperty, BoolProperty, IntProperty, EnumProperty, PointerProperty, CollectionProperty, FloatProperty, FloatVectorProperty
 from bpy.types import Panel, Operator, PropertyGroup, Scene, Menu, OperatorFileListElement, UIList
 
 # other addon code
@@ -48,8 +48,10 @@ from .utils import hashing as hash_m
 from .utils import memoryStream as memoryStream_m
 from .utils import logger as logger_m
 from .utils import constants as constants_m
+from .utils import hd2_baker as hd2_baker_m
 
 importlib.reload(constants_m)
+importlib.reload(hd2_baker_m)
 importlib.reload(memoryStream_m)
 importlib.reload(logger_m)
 importlib.reload(animation_m)
@@ -72,13 +74,14 @@ from .stingray.particle import StingrayParticles
 from .stingray.state_machine import StingrayStateMachine
 from .stingray.bones import LoadBoneHashes, StingrayBones
 from .stingray.composite_unit import StingrayCompositeMesh
-from .stingray.unit import CreateModel, GetObjectsMeshData, StingrayMeshFile
+from .stingray.unit import CreateModel, GetObjectsMeshData, GetMeshData, StingrayMeshFile
 from .utils.slim import is_slim_version, load_package, get_package_toc, slim_init
 
 from .utils.hashing import murmur64_hash
 from .utils.memoryStream import MemoryStream
-from .utils.logger import PrettyPrint
+from .utils.logger import PrettyPrint, SetLogFile, CloseLogFile
 from .utils.constants import *
+from .utils.hd2_baker import HD2Baker, has_hd2_shader, find_hd2_shader_node
 
 #endregion
 
@@ -101,6 +104,8 @@ Global_defaultgamepath   = Global_defaultgamepath[:len(Global_defaultgamepath) -
 Global_gamepath          = ""
 Global_gamepathIsValid   = False
 Global_searchpath        = ""
+Global_filediverpath     = ""
+Global_filediverpathIsValid = False
 Global_configpath        = f"{AddonPath}.ini"
 
 Global_Foldouts = {}
@@ -450,10 +455,22 @@ def GetEntryParentMaterialID(entry):
 
 #endregion
 
+#region Temp Folder Helper
+
+def get_temp_folder():
+    """Get the temp folder using Blender's temp directory."""
+    temp_folder = os.path.join(bpy.app.tempdir, "HD2SDK")
+    if not os.path.exists(temp_folder):
+        os.makedirs(temp_folder)
+    return temp_folder
+
+#endregion
+
 #region Configuration
 
 def InitializeConfig():
     global Global_gamepath, Global_searchpath, Global_configpath, Global_gamepathIsValid
+    global Global_filediverpath, Global_filediverpathIsValid
     if os.path.exists(Global_configpath):
         config = configparser.ConfigParser()
         config.read(Global_configpath, encoding='utf-8')
@@ -462,6 +479,10 @@ def InitializeConfig():
             Global_searchpath = config['DEFAULT']['searchpath']
         except:
             UpdateConfig()
+        try:
+            Global_filediverpath = config['DEFAULT'].get('filediverpath', '')
+        except:
+            pass
         if os.path.exists(Global_gamepath):
             PrettyPrint(f"Loaded Data Folder: {Global_gamepath}")
             slim_init(Global_gamepath)
@@ -469,18 +490,30 @@ def InitializeConfig():
         else:
             PrettyPrint(f"Game path: {Global_gamepath} is not a valid directory", 'ERROR')
             Global_gamepathIsValid = False
+        # Validate filediver path
+        filediver_exe = os.path.join(Global_filediverpath, "filediver.exe")
+        if Global_filediverpath and os.path.exists(filediver_exe):
+            PrettyPrint(f"Loaded Filediver Path: {Global_filediverpath}")
+            Global_filediverpathIsValid = True
+        else:
+            Global_filediverpathIsValid = False
 
     else:
         UpdateConfig()
 
 def UpdateConfig():
     global Global_gamepath, Global_searchpath, Global_defaultgamepath, Global_gamepathIsValid
+    global Global_filediverpath
     if Global_gamepath == "":
         Global_gamepath = Global_defaultgamepath
-    if Global_gamepathIsValid: 
+    if Global_gamepathIsValid:
         slim_init(Global_gamepath)
     config = configparser.ConfigParser()
-    config['DEFAULT'] = {'filepath' : Global_gamepath, 'searchpath' : Global_searchpath}
+    config['DEFAULT'] = {
+        'filepath': Global_gamepath,
+        'searchpath': Global_searchpath,
+        'filediverpath': Global_filediverpath
+    }
     with open(Global_configpath, 'w') as configfile:
         config.write(configfile)
     
@@ -527,12 +560,13 @@ class TocEntry:
 
     # -- Write TocEntry Data -- #
     def SerializeData(self, TocFile: MemoryStream, GpuFile, StreamFile):
-        if TocFile.IsReading():
-            TocFile.seek(self.TocDataOffset)
-            self.TocData = bytearray(self.TocDataSize)
-        elif TocFile.IsWriting():
+        if TocFile.IsWriting():
             self.TocDataOffset = TocFile.tell()
-        self.TocData = TocFile.bytes(self.TocData)
+        if self.TocDataSize > 0:
+            if TocFile.IsReading():
+                TocFile.seek(self.TocDataOffset)
+                self.TocData = bytearray(self.TocDataSize)
+            self.TocData = TocFile.bytes(self.TocData)
 
         if GpuFile.IsWriting(): self.GpuResourceOffset = ceil(float(GpuFile.tell())/64)*64
         if self.GpuResourceSize > 0:
@@ -1242,6 +1276,12 @@ def SaveStingrayMaterial(self, ID, TocData, GpuData, StreamData, LoadedData):
             Entry.TypeID = TexID
             Entry.IsCreated = True
             Entry.SetData(Toc.Data, Gpu.Data, Stream.Data, False)
+
+            # Check for existing entry and remove it before adding
+            ExistingEntry = Global_TocManager.GetEntry(Entry.FileID, Entry.TypeID)
+            if ExistingEntry:
+                Global_TocManager.RemoveEntryFromPatch(ExistingEntry.FileID, ExistingEntry.TypeID)
+
             Global_TocManager.AddNewEntryToPatch(Entry)
             mat.TexIDs[TexIdx] = TextureID
         else:
@@ -1264,13 +1304,14 @@ def SaveStingrayMaterial(self, ID, TocData, GpuData, StreamData, LoadedData):
                 Global_TocManager.AddNewEntryToPatch(Entry)
                 mat.TexIDs[TexIdx] = TextureID
                 
-        if self.MaterialTemplate != None:
+        # Only use template texture if DEV_DDSPaths wasn't already used
+        if self.MaterialTemplate != None and mat.DEV_DDSPaths[TexIdx] == None:
             path = texturesFilepaths[TexIdx]
             if not os.path.exists(path):
                 raise Exception(f"Could not find file at path: {path}")
             if not Entry:
                 raise Exception(f"Could not find or generate texture entry ID: {int(mat.TexIDs[TexIdx])}")
-            
+
             if path.endswith(".dds"):
                 SaveImageDDS(path, Entry.FileID)
             else:
@@ -1544,7 +1585,7 @@ def GenerateMaterialTextures(Entry):
                 ID = image.name.split(".")[0]
                 if not os.path.exists(path) and ID.isnumeric():
                     PrettyPrint(f"Image not found. Attempting to find image: {ID} in temp folder.", 'WARN')
-                    tempdir = tempfile.gettempdir()
+                    tempdir = get_temp_folder()
                     path = f"{tempdir}/{ID}.png"
                 filepaths.append(path)
 
@@ -1584,7 +1625,7 @@ def GenerateMaterialTextures(Entry):
 #region Classes and Functions: Stingray Textures
 
 def BlendImageToStingrayTexture(image, StingrayTex):
-    tempdir  = tempfile.gettempdir()
+    tempdir  = get_temp_folder()
     dds_path = f"{tempdir}/blender_img.dds"
     tga_path = f"{tempdir}/blender_img.tga"
 
@@ -1610,7 +1651,7 @@ def LoadStingrayTexture(ID, TocData, GpuData, StreamData, Reload, MakeBlendObjec
     dds = StingrayTex.ToDDS()
 
     if MakeBlendObject and not (exists and not Reload):
-        tempdir = tempfile.gettempdir()
+        tempdir = get_temp_folder()
         dds_path = f"{tempdir}/{ID}.dds"
         png_path = f"{tempdir}/{ID}.png"
 
@@ -1917,6 +1958,37 @@ class ChangeSearchpathOperator(Operator, ImportHelper):
         PrettyPrint(f"Changed Game Search Path: {Global_searchpath}")
         return{'FINISHED'}
 
+class ChangeFilediverPathOperator(Operator, ImportHelper):
+    bl_label = "Change Filediver Path"
+    bl_idname = "helldiver2.change_filediverpath"
+    bl_description = "Set the path to your filediver installation folder"
+    use_filter_folder = True
+
+    filter_glob: StringProperty(options={'HIDDEN'}, default='')
+
+    def __init__(self):
+        global Global_filediverpath
+        if Global_filediverpath:
+            self.filepath = bpy.path.abspath(Global_filediverpath)
+
+    def execute(self, context):
+        global Global_filediverpath, Global_filediverpathIsValid
+        # Get directory from filepath
+        filepath = self.filepath
+        if os.path.isfile(filepath):
+            filepath = os.path.dirname(filepath)
+
+        filediver_exe = os.path.join(filepath, "filediver.exe")
+        if not os.path.exists(filediver_exe):
+            self.report({'ERROR'}, f"filediver.exe not found in: {filepath}")
+            return {'CANCELLED'}
+
+        Global_filediverpath = filepath
+        Global_filediverpathIsValid = True
+        UpdateConfig()
+        PrettyPrint(f"Changed Filediver Path: {Global_filediverpath}")
+        return {'FINISHED'}
+
 class DefaultLoadArchiveOperator(Operator):
     bl_label = "Default Archive"
     bl_description = "Loads the Default Archive that Patches should be built upon"
@@ -2021,6 +2093,64 @@ class BulkLoadOperator(Operator, ImportHelper):
                 bpy.context.scene.Hd2ToolPanelSettings.LoadedArchives = item
                 break
         return{'FINISHED'}
+    
+class FixNinjaRipperOperator(Operator):
+    bl_label = "Fix Ninja Ripper Imports"
+    bl_idname = "helldiver2.fix_ninja_ripper"
+    bl_description = "Transforms Ninja Ripper HD2 exports: rotates 90° on X, centers on player position, sets camera view"
+
+    def execute(self, context):
+        import bmesh
+        import mathutils
+        from math import radians
+
+        # HD2 Ninja Ripper standard fix values
+        rotation_matrix = mathutils.Matrix.Rotation(radians(90), 4, 'X')
+        translation_offset = mathutils.Vector((0.721674, 1.001493, -0.168735))
+
+        # Get all selected mesh objects
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+
+        if not selected_meshes:
+            self.report({'WARNING'}, "No mesh objects selected. Select Ninja Ripper meshes first.")
+            return {'CANCELLED'}
+
+        # Transform all selected meshes
+        for obj in selected_meshes:
+            mesh = obj.data
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+
+            # Apply rotation then translation to all vertices
+            for vert in bm.verts:
+                vert.co = rotation_matrix @ vert.co
+                vert.co += translation_offset
+
+            bm.to_mesh(mesh)
+            bm.free()
+            mesh.update()
+
+        # Set viewport camera position
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        r3d = space.region_3d
+                        r3d.view_perspective = 'PERSP'
+                        r3d.view_distance = 2.331160
+
+                        # Set view location and rotation
+                        view_loc = mathutils.Vector((1.894437, 0.610886, 0.387552))
+                        view_rot = mathutils.Euler((1.387990, 0.013756, 1.872079))
+
+                        # Build view matrix from location and rotation
+                        view_matrix = view_rot.to_matrix().to_4x4()
+                        view_matrix.translation = view_loc
+                        r3d.view_matrix = view_matrix.inverted()
+                        break
+
+        self.report({'INFO'}, f"Fixed {len(selected_meshes)} Ninja Ripper meshes")
+        return {'FINISHED'}
 
 class SearchByEntryIDOperator(Operator, ImportHelper):
     bl_label = "Bulk Search By Entry ID"
@@ -2203,7 +2333,7 @@ class ExportPatchAsZipOperator(Operator, ExportHelper):
         exportname = os.path.basename(filepath)
         
         patchName = Global_TocManager.ActivePatch.Name
-        tempPatchFolder = bpy.app.tempdir + "patchExport/"
+        tempPatchFolder = get_temp_folder() + "/patchExport/"
         tempPatchFile = f"{tempPatchFolder}/{patchName}"
         PrettyPrint(f"Exporting in temp folder: {tempPatchFolder}")
 
@@ -2222,7 +2352,685 @@ class ExportPatchAsZipOperator(Operator, ExportHelper):
             self.report({'ERROR'}, f"Failed to Export {patchName}")
 
         return {'FINISHED'}
-    
+
+def detect_patch_conflicts():
+    """
+    Scans all patches for entries with the same FileID.
+    Returns: {(FileID, TypeID): [patch_name1, patch_name2, ...]}
+    """
+    entry_sources = {}  # {(FileID, TypeID): [patch_names]}
+
+    for patch in Global_TocManager.Patches:
+        for type_id, entries in patch.TocDict.items():
+            for file_id in entries.keys():
+                key = (file_id, type_id)
+                if key not in entry_sources:
+                    entry_sources[key] = []
+                entry_sources[key].append(patch.Name)
+
+    # Filter to only entries with 2+ sources (conflicts)
+    conflicts = {k: v for k, v in entry_sources.items() if len(v) > 1}
+    return conflicts
+
+class CombinePatchesOperator(Operator):
+    bl_label = "Combine Patches"
+    bl_idname = "helldiver2.combine_patches"
+    bl_description = "Combines all loaded patches into a single patch"
+
+    combined_name: StringProperty(name="Combined Mod Name", default="Combined Patch")
+
+    def invoke(self, context, event):
+        if len(Global_TocManager.Patches) < 2:
+            self.report({'ERROR'}, "Need at least 2 patches to combine")
+            return {'CANCELLED'}
+
+        if ArchivesNotLoaded(self):
+            return {'CANCELLED'}
+
+        # Detect conflicts
+        conflicts = detect_patch_conflicts()
+
+        # Populate conflict list in scene settings
+        settings = context.scene.Hd2ToolPanelSettings
+        settings.combine_conflicts.clear()
+
+        for (file_id, type_id), patch_names in conflicts.items():
+            item = settings.combine_conflicts.add()
+            item.file_id = str(file_id)
+            item.type_id = str(type_id)
+            # Get friendly name (hex without 0x prefix)
+            hex_id = format(file_id, 'x')
+            item.friendly_name = GetArchiveNameFromID(hex_id) or f"0x{hex_id}"
+            item.patches = ",".join(patch_names)
+
+        # Show dialog (wider if conflicts exist)
+        width = 500 if len(conflicts) > 0 else 300
+        return context.window_manager.invoke_props_dialog(self, width=width)
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.Hd2ToolPanelSettings
+
+        # Combined name input
+        layout.prop(self, "combined_name")
+        layout.separator()
+
+        # Show patch count
+        layout.label(text=f"Combining {len(Global_TocManager.Patches)} patches")
+
+        if len(settings.combine_conflicts) > 0:
+            layout.separator()
+            box = layout.box()
+            box.label(text=f"Conflicts ({len(settings.combine_conflicts)}):", icon='ERROR')
+
+            # List conflicts with dropdown for each
+            for item in settings.combine_conflicts:
+                row = box.row()
+                row.label(text=item.friendly_name)
+                row.prop(item, "selected_patch", text="")
+        else:
+            layout.label(text="No conflicts detected", icon='CHECKMARK')
+
+    def execute(self, context):
+        settings = context.scene.Hd2ToolPanelSettings
+
+        # Build conflict resolution map: {(file_id, type_id): winning_patch_name}
+        resolution = {}
+        for item in settings.combine_conflicts:
+            key = (int(item.file_id), int(item.type_id))
+            resolution[key] = item.selected_patch
+
+        # Create combined patch
+        Global_TocManager.CreatePatchFromActive(name=self.combined_name)
+        combined_patch = Global_TocManager.Patches[-1]  # Newly created
+
+        # Track which patches to remove (all except combined)
+        old_patches = Global_TocManager.Patches[:-1]
+
+        entries_added = 0
+        for patch in old_patches:
+            for type_id, entries in patch.TocDict.items():
+                for file_id, entry in entries.items():
+                    key = (file_id, type_id)
+
+                    # Check if this is a conflict
+                    if key in resolution:
+                        # Only add if this patch is the winner
+                        if resolution[key] != patch.Name:
+                            continue
+
+                    # Check if already exists in combined
+                    existing = combined_patch.GetEntry(file_id, type_id)
+                    if existing is None:
+                        new_entry = deepcopy(entry)
+                        combined_patch.AddEntry(new_entry, override=False)
+                        entries_added += 1
+                    elif key not in resolution:
+                        # Not a user-resolved conflict, use last-wins
+                        new_entry = deepcopy(entry)
+                        combined_patch.AddEntry(new_entry, override=True)
+
+        # Unload old patches, keep only combined
+        Global_TocManager.Patches = [combined_patch]
+        Global_TocManager.SetActivePatch(combined_patch)
+
+        self.report({'INFO'}, f"Combined into '{self.combined_name}' ({entries_added} entries)")
+
+        # Redraw UI
+        for area in context.screen.areas:
+            if area.type == "VIEW_3D": area.tag_redraw()
+
+        return {'FINISHED'}
+
+def draw_repatch_status(self, context):
+    """Draw status text in bottom left of viewport"""
+    import blf
+    font_id = 0
+    blf.size(font_id, 16)
+    blf.color(font_id, 1.0, 0.8, 0.2, 1.0)  # Yellow-orange color
+    blf.position(font_id, 20, 60, 0)
+    blf.draw(font_id, RepatchModOperator._status_text)
+    # Draw secondary info
+    blf.size(font_id, 12)
+    blf.color(font_id, 0.8, 0.8, 0.8, 1.0)  # Light gray
+    blf.position(font_id, 20, 40, 0)
+    blf.draw(font_id, "Press ESC to cancel")
+
+def repatch_single_unit(file_id, patch, blender_opts, cleanup_objects=False):
+    """
+    Core repatch logic for a single unit. Used by both RepatchModOperator and RepatchFolderOperator.
+
+    Args:
+        file_id: The unit file ID to repatch
+        patch: The patch containing the unit entry
+        blender_opts: Blender options dict for serialization
+        cleanup_objects: If True, removes created Blender objects after processing
+
+    Returns:
+        tuple: (success: bool, new_objects: list) - success status and list of created objects
+    """
+    settings = bpy.context.scene.Hd2ToolPanelSettings
+
+    # Step 1: Import from patch entry
+    patch_entry = patch.GetEntry(file_id, UnitID)
+    if patch_entry is None:
+        PrettyPrint(f"Could not find patch entry for {file_id}")
+        return (False, [])
+
+    # Import all mesh types - we want everything from the patch
+    settings.AutoLods = True
+    settings.ImportStatic = True
+    settings.ImportLods = True
+
+    # Use the exact same operator as the UI Import Unit button
+    PrettyPrint(f"Importing unit: {file_id}")
+    bpy.ops.helldiver2.archive_unit_import(object_id=str(file_id))
+
+    # Find newly created objects - look for objects with matching Z_ObjectID
+    new_objects = [obj for obj in bpy.context.scene.objects
+                  if obj.get('Z_ObjectID') == str(file_id) and obj.type == 'MESH']
+    PrettyPrint(f"Found {len(new_objects)} mesh objects for unit {file_id}")
+
+    if len(new_objects) == 0:
+        PrettyPrint(f"No mesh objects created for unit {file_id}, skipping")
+        return (False, [])
+
+    # Step 2: Store old MeshInfoIndex from imported patch object
+    old_mesh_info_index = new_objects[0].get('MeshInfoIndex', 0)
+    PrettyPrint(f"Old MeshInfoIndex from patch: {old_mesh_info_index}")
+
+    # Step 3: Ensure game archive is loaded, then remove entry from patch and add fresh
+    Global_TocManager.GetEntryByLoadArchive(file_id, UnitID)
+    Global_TocManager.RemoveEntryFromPatch(file_id, UnitID)
+    Global_TocManager.AddEntryToPatch(file_id, UnitID)
+
+    # Step 4: Load fresh entry from game archive (without Blender objects)
+    new_entry = Global_TocManager.GetEntry(file_id, UnitID)
+    if new_entry is None:
+        PrettyPrint(f"Could not create new entry for {file_id}")
+        if cleanup_objects:
+            for obj in new_objects:
+                bpy.data.objects.remove(obj)
+            return (False, [])
+        return (False, new_objects)
+
+    new_entry.Load(Reload=False, MakeBlendObject=False, LoadMaterialSlotNames=True)
+
+    # Step 5: Find new MeshInfoIndex for LOD 0 and update if changed
+    new_mesh_info_index = None
+    for mesh in new_entry.LoadedData.RawMeshes:
+        if mesh.LodIndex == 0:
+            new_mesh_info_index = mesh.MeshInfoIndex
+            break
+
+    if new_mesh_info_index is not None and old_mesh_info_index != new_mesh_info_index:
+        PrettyPrint(f"Updating MeshInfoIndex: {old_mesh_info_index} -> {new_mesh_info_index}")
+        for obj in new_objects:
+            if obj.get('MeshInfoIndex') == old_mesh_info_index:
+                obj['MeshInfoIndex'] = new_mesh_info_index
+
+    # Step 6: Select all new objects and extract mesh data
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in new_objects:
+        obj.select_set(True)
+    if len(new_objects) > 0:
+        bpy.context.view_layer.objects.active = new_objects[0]
+
+    # Step 7: Extract mesh data from Blender objects and replace in entry
+    mesh_data = GetObjectsMeshData(Global_TocManager, Global_BoneNames)
+    obj_id = str(file_id)
+    if obj_id in mesh_data:
+        for mesh_index, mesh in mesh_data[obj_id].items():
+            try:
+                new_entry.LoadedData.RawMeshes[mesh_index] = mesh
+            except IndexError:
+                PrettyPrint(f"MeshInfoIndex {mesh_index} exceeds mesh count for unit {file_id}")
+
+    # Step 8: Save
+    success = new_entry.Save(BlenderOpts=blender_opts)
+    if success:
+        PrettyPrint(f"Saved unit: {file_id}")
+    else:
+        PrettyPrint(f"Failed to save unit {file_id}")
+
+    # Cleanup objects if requested
+    if cleanup_objects:
+        for obj in new_objects:
+            bpy.data.objects.remove(obj)
+        new_objects = []
+
+    return (success, new_objects)
+
+class RepatchModOperator(Operator):
+    bl_label = "Repatch Units"
+    bl_idname = "helldiver2.repatch_mod"
+    bl_description = "Imports mod meshes into Blender, reloads from game archives, and re-saves. Use after game updates"
+
+    _timer = None
+    _draw_handler = None
+    _state = "INIT"
+    _status_text = ""
+    _unit_file_ids = []
+    _imported_objects = []
+    _mesh_data = {}
+    _ids = []
+    _current_index = 0
+    _units_saved = 0
+    _units_failed = 0
+    _blender_opts = None
+    _patch = None
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self.cancel(context)
+            self.report({'WARNING'}, "Repatch cancelled by user")
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            # Process based on current state
+            if self._state == "IMPORTING":
+                return self.process_import(context)
+            elif self._state == "DONE":
+                return self.finish(context)
+
+        return {'PASS_THROUGH'}
+
+    def invoke(self, context, event):
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        self._patch = Global_TocManager.ActivePatch
+
+        # Collect unit entries
+        self._unit_file_ids = []
+        if UnitID in self._patch.TocDict:
+            for file_id in list(self._patch.TocDict[UnitID].keys()):
+                self._unit_file_ids.append(file_id)
+
+        if len(self._unit_file_ids) == 0:
+            self.report({'WARNING'}, "No unit entries found in patch")
+            return {'CANCELLED'}
+
+        # Initialize state
+        self._state = "IMPORTING"
+        self._current_index = 0
+        self._imported_objects = []
+        self._mesh_data = {}
+        self._ids = []
+        self._units_saved = 0
+        self._units_failed = 0
+        self._existing_objects = set(bpy.context.scene.objects)
+        self._blender_opts = bpy.context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        self._tried_static = False  # Track if we've tried static mesh import
+        self._current_old_mesh_info_index = None  # Track MeshInfoIndex from patch
+
+        # Store original settings (we'll restore them when done)
+        settings = bpy.context.scene.Hd2ToolPanelSettings
+        self._orig_import_lods = settings.ImportLods
+        self._orig_import_static = settings.ImportStatic
+        self._orig_auto_lods = settings.AutoLods
+
+        PrettyPrint(f"Found {len(self._unit_file_ids)} unit entries to repatch")
+        context.window_manager.progress_begin(0, len(self._unit_file_ids) * 2)
+
+        # Set initial status
+        RepatchModOperator._status_text = f"Repatch: Starting... (0/{len(self._unit_file_ids)} units)"
+
+        # Add draw handler for status text
+        RepatchModOperator._draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_repatch_status, (self, context), 'WINDOW', 'POST_PIXEL')
+
+        # Start timer
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+
+        return {'RUNNING_MODAL'}
+
+    def process_import(self, context):
+        """Process one unit at a time: import from patch, save to new archive data, cleanup"""
+        if self._current_index >= len(self._unit_file_ids):
+            # Done with all units
+            self._state = "DONE"
+            return {'PASS_THROUGH'}
+
+        file_id = self._unit_file_ids[self._current_index]
+
+        # Update status
+        RepatchModOperator._status_text = f"Repatch: Processing unit {self._current_index + 1}/{len(self._unit_file_ids)}"
+
+        try:
+            # Use shared repatch function (keep objects in scene for inspection)
+            success, new_objects = repatch_single_unit(file_id, self._patch, self._blender_opts, cleanup_objects=False)
+
+            if success:
+                self._units_saved += 1
+            else:
+                self._units_failed += 1
+
+        except Exception as e:
+            PrettyPrint(f"Error processing unit {file_id}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self._units_failed += 1
+
+        context.window_manager.progress_update(self._current_index)
+        self._current_index += 1
+
+        # Redraw UI
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        return {'PASS_THROUGH'}
+
+    def finish(self, context):
+        self.cancel(context)
+        context.window_manager.progress_end()
+
+        if self._units_failed > 0:
+            self.report({'WARNING'}, f"Repatched {self._units_saved} units, {self._units_failed} failed")
+        else:
+            self.report({'INFO'}, f"Repatched {self._units_saved} units successfully")
+
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        if self._timer:
+            wm = context.window_manager
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        if RepatchModOperator._draw_handler:
+            bpy.types.SpaceView3D.draw_handler_remove(RepatchModOperator._draw_handler, 'WINDOW')
+            RepatchModOperator._draw_handler = None
+        # Restore original settings
+        try:
+            settings = bpy.context.scene.Hd2ToolPanelSettings
+            if hasattr(self, '_orig_import_lods'):
+                settings.ImportLods = self._orig_import_lods
+            if hasattr(self, '_orig_import_static'):
+                settings.ImportStatic = self._orig_import_static
+            if hasattr(self, '_orig_auto_lods'):
+                settings.AutoLods = self._orig_auto_lods
+        except Exception:
+            pass  # Scene may not exist during shutdown
+        # Force redraw to clear status text
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+def draw_repatch_folder_status(self, context):
+    """Draw status text in bottom left of viewport for folder repatch"""
+    import blf
+    font_id = 0
+    blf.size(font_id, 16)
+    blf.color(font_id, 1.0, 0.8, 0.2, 1.0)  # Yellow-orange color
+    blf.position(font_id, 20, 80, 0)
+    blf.draw(font_id, RepatchFolderOperator._status_text)
+    # Draw secondary info
+    blf.size(font_id, 12)
+    blf.color(font_id, 0.8, 0.8, 0.8, 1.0)  # Light gray
+    blf.position(font_id, 20, 60, 0)
+    blf.draw(font_id, RepatchFolderOperator._status_text2)
+    blf.position(font_id, 20, 40, 0)
+    blf.draw(font_id, "Press ESC to cancel")
+
+class RepatchFolderOperator(Operator, ImportHelper):
+    bl_label = "Repatch Folder"
+    bl_idname = "helldiver2.repatch_folder"
+    bl_description = "Loads each patch in folder, runs full repatch (import from patch, reload from game, re-save), then writes patch"
+
+    directory: StringProperty(subtype='DIR_PATH')
+    filter_glob: StringProperty(default='*', options={'HIDDEN'})
+
+    _timer = None
+    _draw_handler = None
+    _state = "INIT"
+    _status_text = ""
+    _status_text2 = ""
+
+    # Patch-level tracking
+    _patch_files = []
+    _current_patch_index = 0
+    _patches_completed = 0
+    _patches_failed = 0
+
+    # Unit-level tracking (within current patch)
+    _unit_file_ids = []
+    _current_unit_index = 0
+    _units_saved = 0
+    _units_failed = 0
+
+    _blender_opts = None
+    _existing_objects = set()
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        folder_path = self.directory
+        if not folder_path or not os.path.isdir(folder_path):
+            self.report({'ERROR'}, "Invalid folder selected")
+            return {'CANCELLED'}
+
+        # Find all .patch_0 files in the folder (only patch_0, not other patch numbers)
+        self._patch_files = []
+        for root, dirs, files in os.walk(folder_path):
+            for file in files:
+                if file.endswith('.patch_0'):
+                    self._patch_files.append(os.path.join(root, file))
+
+        if len(self._patch_files) == 0:
+            self.report({'ERROR'}, "No .patch_0 files found in folder")
+            return {'CANCELLED'}
+
+        # Initialize state
+        self._state = "LOADING_PATCH"
+        self._current_patch_index = 0
+        self._patches_completed = 0
+        self._patches_failed = 0
+        self._unit_file_ids = []
+        self._current_unit_index = 0
+        self._units_saved = 0
+        self._units_failed = 0
+        self._blender_opts = bpy.context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        self._existing_objects = set(bpy.context.scene.objects)
+
+        # Store original settings
+        settings = bpy.context.scene.Hd2ToolPanelSettings
+        self._orig_import_lods = settings.ImportLods
+        self._orig_import_static = settings.ImportStatic
+        self._orig_auto_lods = settings.AutoLods
+
+        PrettyPrint(f"Found {len(self._patch_files)} patch files to repatch")
+
+        # Set initial status
+        RepatchFolderOperator._status_text = f"Repatch Folder: Starting... (0/{len(self._patch_files)} patches)"
+        RepatchFolderOperator._status_text2 = ""
+
+        # Add draw handler for status text
+        RepatchFolderOperator._draw_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_repatch_folder_status, (self, context), 'WINDOW', 'POST_PIXEL')
+
+        # Start timer
+        wm = context.window_manager
+        self._timer = wm.event_timer_add(0.01, window=context.window)
+        wm.modal_handler_add(self)
+
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type == 'ESC':
+            self.cancel(context)
+            self.report({'WARNING'}, "Repatch folder cancelled by user")
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            if self._state == "LOADING_PATCH":
+                return self.load_next_patch(context)
+            elif self._state == "IMPORTING":
+                return self.process_unit(context)
+            elif self._state == "WRITING_PATCH":
+                return self.write_patch(context)
+            elif self._state == "DONE":
+                return self.finish(context)
+
+        return {'PASS_THROUGH'}
+
+    def load_next_patch(self, context):
+        """Load the next patch file"""
+        if self._current_patch_index >= len(self._patch_files):
+            self._state = "DONE"
+            return {'PASS_THROUGH'}
+
+        patch_path = self._patch_files[self._current_patch_index]
+        patch_name = os.path.basename(patch_path)
+
+        RepatchFolderOperator._status_text = f"Repatch Folder: Loading patch {self._current_patch_index + 1}/{len(self._patch_files)}"
+        RepatchFolderOperator._status_text2 = f"File: {patch_name}"
+
+        try:
+            PrettyPrint(f"Loading patch: {patch_path}")
+
+            # Load as the active patch
+            Global_TocManager.LoadArchive(patch_path, SetActive=True, IsPatch=True)
+
+            if Global_TocManager.ActivePatch is None:
+                PrettyPrint(f"Failed to load patch: {patch_path}")
+                self._patches_failed += 1
+                self._current_patch_index += 1
+                return {'PASS_THROUGH'}
+
+            # Collect unit entries from this patch
+            self._unit_file_ids = []
+            if UnitID in Global_TocManager.ActivePatch.TocDict:
+                for file_id in list(Global_TocManager.ActivePatch.TocDict[UnitID].keys()):
+                    self._unit_file_ids.append(file_id)
+
+            if len(self._unit_file_ids) == 0:
+                PrettyPrint(f"No unit entries found in patch {patch_name}, writing and moving on")
+                # No units to process, just write and move on
+                self._state = "WRITING_PATCH"
+            else:
+                # Reset unit tracking for this patch
+                self._current_unit_index = 0
+                self._units_saved = 0
+                self._units_failed = 0
+                PrettyPrint(f"Found {len(self._unit_file_ids)} units to repatch in {patch_name}")
+                self._state = "IMPORTING"
+
+        except Exception as e:
+            PrettyPrint(f"Error loading patch {patch_path}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self._patches_failed += 1
+            self._current_patch_index += 1
+
+        return {'PASS_THROUGH'}
+
+    def process_unit(self, context):
+        """Process one unit at a time using shared repatch logic"""
+        if self._current_unit_index >= len(self._unit_file_ids):
+            # Done with all units for this patch, write it
+            self._state = "WRITING_PATCH"
+            return {'PASS_THROUGH'}
+
+        file_id = self._unit_file_ids[self._current_unit_index]
+        patch_name = os.path.basename(self._patch_files[self._current_patch_index])
+
+        # Update status
+        RepatchFolderOperator._status_text = f"Repatch Folder: Patch {self._current_patch_index + 1}/{len(self._patch_files)}"
+        RepatchFolderOperator._status_text2 = f"{patch_name}: Unit {self._current_unit_index + 1}/{len(self._unit_file_ids)}"
+
+        try:
+            # Use shared repatch function (keep objects in scene for inspection)
+            success, _ = repatch_single_unit(file_id, Global_TocManager.ActivePatch, self._blender_opts, cleanup_objects=False)
+
+            if success:
+                self._units_saved += 1
+            else:
+                self._units_failed += 1
+
+        except Exception as e:
+            PrettyPrint(f"Error processing unit {file_id}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self._units_failed += 1
+
+        self._current_unit_index += 1
+
+        # Redraw UI
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        return {'PASS_THROUGH'}
+
+    def write_patch(self, context):
+        """Write the current patch and move to next"""
+        patch_path = self._patch_files[self._current_patch_index]
+        patch_name = os.path.basename(patch_path)
+
+        RepatchFolderOperator._status_text = f"Repatch Folder: Writing patch {self._current_patch_index + 1}/{len(self._patch_files)}"
+        RepatchFolderOperator._status_text2 = f"File: {patch_name}"
+
+        try:
+            # Write the patch
+            Global_TocManager.PatchActiveArchive()
+            PrettyPrint(f"Wrote patch: {patch_name} ({self._units_saved} units saved, {self._units_failed} failed)")
+            self._patches_completed += 1
+        except Exception as e:
+            PrettyPrint(f"Error writing patch {patch_name}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            self._patches_failed += 1
+
+        # Move to next patch
+        self._current_patch_index += 1
+
+        # Unload patches to prepare for next one
+        Global_TocManager.UnloadPatches()
+
+        self._state = "LOADING_PATCH"
+
+        # Redraw UI
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        return {'PASS_THROUGH'}
+
+    def finish(self, context):
+        self.cancel(context)
+
+        total_patches = len(self._patch_files)
+        if self._patches_failed > 0:
+            self.report({'WARNING'}, f"Repatched {self._patches_completed}/{total_patches} patches, {self._patches_failed} failed")
+        else:
+            self.report({'INFO'}, f"Repatched {self._patches_completed}/{total_patches} patches successfully")
+
+        return {'FINISHED'}
+
+    def cancel(self, context):
+        if self._timer:
+            wm = context.window_manager
+            wm.event_timer_remove(self._timer)
+            self._timer = None
+        if RepatchFolderOperator._draw_handler:
+            bpy.types.SpaceView3D.draw_handler_remove(RepatchFolderOperator._draw_handler, 'WINDOW')
+            RepatchFolderOperator._draw_handler = None
+        # Restore original settings
+        try:
+            settings = bpy.context.scene.Hd2ToolPanelSettings
+            if hasattr(self, '_orig_import_lods'):
+                settings.ImportLods = self._orig_import_lods
+            if hasattr(self, '_orig_import_static'):
+                settings.ImportStatic = self._orig_import_static
+            if hasattr(self, '_orig_auto_lods'):
+                settings.AutoLods = self._orig_auto_lods
+        except Exception:
+            pass
+        # Force redraw
+        for area in context.screen.areas:
+            area.tag_redraw()
+
 class NextArchiveOperator(Operator):
     bl_label = "Next Archive"
     bl_idname = "helldiver2.next_archive"
@@ -2681,6 +3489,1492 @@ class ImportStingrayUnitOperator(Operator):
         #     raise Exception("One or more meshes failed to load")
         return{'FINISHED'}
 
+class ImportMeshWithShaderOperator(Operator):
+    bl_label = "Import Mesh with Shader"
+    bl_idname = "helldiver2.import_mesh_with_shader"
+    bl_description = "Import mesh with accurate shader using filediver"
+
+    object_id: StringProperty()
+
+    def execute(self, context):
+        global Global_filediverpath, Global_filediverpathIsValid, Global_gamepath
+
+        # Validate filediver path
+        if not Global_filediverpathIsValid:
+            self.report({'ERROR'}, "Filediver path not set. Please set it in Settings.")
+            context.scene.Hd2ToolPanelSettings.MenuExpanded = True
+            return {'CANCELLED'}
+
+        if not Global_gamepathIsValid:
+            self.report({'ERROR'}, "Game path not set. Please set it in Settings.")
+            context.scene.Hd2ToolPanelSettings.MenuExpanded = True
+            return {'CANCELLED'}
+
+        # Parse object_id - can be comma-separated list of decimal IDs
+        selected_ids = []
+        if self.object_id:
+            for id_str in self.object_id.split(','):
+                id_str = id_str.strip()
+                if id_str:
+                    try:
+                        selected_ids.append(int(id_str))
+                    except ValueError:
+                        pass
+
+        PrettyPrint(f"Selected unit FileIDs to import: {[hex(id) for id in selected_ids]}")
+
+        # Get the archive ID from the active archive or the unit's object ID
+        archive_id = None
+        if selected_ids:
+            # Try to find which archive contains the first unit
+            entry = Global_TocManager.GetEntry(selected_ids[0], UnitID)
+            if entry and hasattr(entry, 'ParentToc') and entry.ParentToc:
+                archive_id = entry.ParentToc.Name
+        if not archive_id and Global_TocManager.ActiveArchive:
+            archive_id = Global_TocManager.ActiveArchive.Name
+
+        if not archive_id:
+            self.report({'ERROR'}, "No archive loaded. Please load an archive first.")
+            return {'CANCELLED'}
+
+        # Ensure archive_id has 0x prefix for filediver
+        if not archive_id.startswith("0x"):
+            archive_id = "0x" + archive_id
+
+        # Step 1: Import regular meshes using SDK import (keeps HD2 properties like Z_ObjectID)
+        sdk_objects = []
+        sdk_fileid_map = {}  # Maps FileID (int) -> list of sdk_obj
+        if selected_ids:
+            objects_before = set(bpy.data.objects)
+
+            # Do regular SDK import for each selected ID
+            for file_id in selected_ids:
+                try:
+                    bpy.ops.helldiver2.archive_unit_import(object_id=str(file_id))
+                except Exception as e:
+                    PrettyPrint(f"SDK import failed for {hex(file_id)}: {e}", 'WARNING')
+
+            # Find newly created objects and build FileID map
+            sdk_objects = list(set(bpy.data.objects) - objects_before)
+            for obj in sdk_objects:
+                if obj.type == 'MESH' and obj.data:
+                    # Get Z_ObjectID (the FileID) from the object
+                    z_object_id = obj.get("Z_ObjectID")
+                    if z_object_id:
+                        try:
+                            file_id = int(z_object_id)
+                            if file_id not in sdk_fileid_map:
+                                sdk_fileid_map[file_id] = []
+                            sdk_fileid_map[file_id].append(obj)
+                        except (ValueError, TypeError):
+                            pass
+
+            PrettyPrint(f"SDK import created {len(sdk_objects)} objects with {len(sdk_fileid_map)} unique FileIDs")
+
+        # Create temp directory for output in Blender's temp folder
+        temp_dir = os.path.join(bpy.app.tempdir, "filediver_exports")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        try:
+            # Build filediver command
+            filediver_exe = os.path.join(Global_filediverpath, "filediver.exe")
+            # Filediver expects game root folder, not the data subfolder
+            game_root = Global_gamepath.rstrip("\\/")
+            if game_root.lower().endswith("data"):
+                game_root = os.path.dirname(game_root)
+            cmd = [
+                filediver_exe,
+                "-g", game_root,
+                "-T", "unit",
+                "--model-format", "glb",
+                "--unit-single-file",
+                "-t", archive_id,
+                "-o", temp_dir
+            ]
+
+            PrettyPrint(f"Running filediver: {' '.join(cmd)}")
+
+            # Run filediver
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+            if result.returncode != 0:
+                PrettyPrint(f"Filediver error: {result.stderr}", 'ERROR')
+                self.report({'ERROR'}, f"Filediver failed: {result.stderr[:200]}")
+                return {'CANCELLED'}
+
+            PrettyPrint(f"Filediver output: {result.stdout}")
+
+            # Find the output glb file
+            glb_file = None
+            for root, dirs, files in os.walk(temp_dir):
+                for f in files:
+                    if f.endswith('.glb'):
+                        glb_file = os.path.join(root, f)
+                        break
+                if glb_file:
+                    break
+
+            if not glb_file:
+                self.report({'ERROR'}, "Filediver did not produce a .glb file")
+                return {'CANCELLED'}
+
+            # Check for hd2_accurate_blender_importer
+            importer_exe = os.path.join(Global_filediverpath, "scripts_dist", "hd2_accurate_blender_importer", "hd2_accurate_blender_importer.exe")
+
+            if os.path.exists(importer_exe):
+                # Use the accurate blender importer
+                blend_output = os.path.join(temp_dir, "output_with_shader.blend")
+                importer_cmd = [importer_exe, glb_file, blend_output, "--packall"]
+
+                PrettyPrint(f"Running importer: {' '.join(importer_cmd)}")
+
+                importer_result = subprocess.run(importer_cmd, capture_output=True, text=True, timeout=300)
+
+                if importer_result.returncode != 0:
+                    PrettyPrint(f"Importer error: {importer_result.stderr}", 'ERROR')
+                    self.report({'WARNING'}, "Accurate importer failed, SDK meshes kept without shaders")
+                else:
+                    # Import filediver blend and transfer materials to SDK objects
+                    PrettyPrint(f"Importing blend file and transferring materials: {blend_output}")
+                    self._import_and_transfer_materials(blend_output, context, sdk_fileid_map, glb_file)
+
+                    # Create SimpleBake local presets for HD2 materials
+                    self._create_simplebake_local_presets(context)
+
+                    # Add imported objects to SimpleBake's bake list
+                    self._add_objects_to_simplebake_list(context, sdk_objects)
+            else:
+                self.report({'INFO'}, "Accurate importer not found, SDK meshes kept without shaders")
+
+            num_units = len(selected_ids) if selected_ids else "all"
+            self.report({'INFO'}, f"Imported {num_units} mesh(es) with shader from archive {archive_id}")
+            return {'FINISHED'}
+
+        except subprocess.TimeoutExpired:
+            self.report({'ERROR'}, "Filediver timed out after 5 minutes")
+            return {'CANCELLED'}
+        except Exception as e:
+            PrettyPrint(f"Error during import: {str(e)}", 'ERROR')
+            import traceback
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Import failed: {str(e)}")
+            return {'CANCELLED'}
+        finally:
+            # Cleanup temp directory
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+
+    def _parse_glb_fileid_mapping(self, glb_path):
+        """Parse GLB file to extract FileID -> mesh node names mapping.
+
+        The GLB's root 'extras' contains a mapping like:
+        {'0x0e26f06370e010d9': {'objects': [21], 'parent': 20, 'skin': 0}, ...}
+
+        Where 'objects' is a list of node indices that have meshes for that FileID.
+
+        Args:
+            glb_path: Path to the GLB file
+
+        Returns:
+            Dict mapping FileID (int) -> list of mesh node names
+        """
+        import struct
+
+        fileid_to_meshnames = {}
+
+        try:
+            with open(glb_path, 'rb') as f:
+                # Read GLB header
+                magic = f.read(4)
+                if magic != b'glTF':
+                    PrettyPrint(f"Invalid GLB file: {glb_path}", 'WARNING')
+                    return fileid_to_meshnames
+
+                version = struct.unpack('<I', f.read(4))[0]
+                length = struct.unpack('<I', f.read(4))[0]
+
+                # Read JSON chunk
+                chunk_len = struct.unpack('<I', f.read(4))[0]
+                chunk_type = f.read(4)
+                json_data = f.read(chunk_len).decode('utf-8')
+                gltf = json.loads(json_data)
+
+                # Get the FileID -> node indices mapping from root extras
+                extras = gltf.get('extras', {})
+                nodes = gltf.get('nodes', [])
+
+                for fileid_hex, data in extras.items():
+                    if not fileid_hex.startswith('0x'):
+                        continue
+
+                    try:
+                        fileid_int = int(fileid_hex, 16)
+                    except ValueError:
+                        continue
+
+                    # Get mesh node names for this FileID
+                    mesh_names = []
+                    object_indices = data.get('objects', [])
+                    for node_idx in object_indices:
+                        if 0 <= node_idx < len(nodes):
+                            node = nodes[node_idx]
+                            # Only include nodes that have meshes
+                            if 'mesh' in node:
+                                mesh_names.append(node.get('name', f'node_{node_idx}'))
+
+                    if mesh_names:
+                        fileid_to_meshnames[fileid_int] = mesh_names
+
+                PrettyPrint(f"Parsed GLB: found {len(fileid_to_meshnames)} FileIDs with mesh mappings")
+
+        except Exception as e:
+            PrettyPrint(f"Error parsing GLB for FileID mapping: {e}", 'WARNING')
+
+        return fileid_to_meshnames
+
+    def _import_and_transfer_materials(self, blend_path, context, sdk_fileid_map, glb_path):
+        """Import filediver .blend file and transfer materials to SDK objects.
+
+        Args:
+            blend_path: Path to the filediver .blend file
+            context: Blender context
+            sdk_fileid_map: Dict mapping FileID (int) -> list of sdk_obj
+            glb_path: Path to the GLB file for parsing FileID -> mesh name mapping
+        """
+        # Parse GLB to get FileID -> mesh names mapping
+        fileid_to_meshnames = self._parse_glb_fileid_mapping(glb_path)
+
+        # Import materials, node groups, and images from filediver blend
+        # Also import objects temporarily to extract their materials
+        with bpy.data.libraries.load(blend_path, link=False) as (data_from, data_to):
+            data_to.objects = data_from.objects
+            data_to.materials = data_from.materials
+            data_to.node_groups = data_from.node_groups
+            data_to.images = data_from.images
+
+        filediver_objects = [obj for obj in data_to.objects if obj is not None]
+        PrettyPrint(f"Loaded {len(filediver_objects)} filediver objects, {len(data_to.materials)} materials")
+
+        # Build filediver name -> object mapping
+        # Also map base names (without Blender's .001 suffix) to handle naming conflicts
+        filediver_name_map = {}  # Maps mesh name -> filediver object
+        filediver_basename_map = {}  # Maps base name (no .NNN suffix) -> filediver object
+        import re
+        blender_suffix_pattern = re.compile(r'\.\d{3}$')  # Matches .001, .002, etc.
+
+        for obj in filediver_objects:
+            if obj.type == 'MESH' and obj.data:
+                filediver_name_map[obj.name] = obj
+                # Also store by base name (strip .001 suffix if present)
+                base_name = blender_suffix_pattern.sub('', obj.name)
+                if base_name not in filediver_basename_map:
+                    filediver_basename_map[base_name] = obj
+
+        PrettyPrint(f"Filediver mesh names: {list(filediver_name_map.keys())}")
+        if filediver_basename_map:
+            PrettyPrint(f"Filediver base names: {list(filediver_basename_map.keys())}")
+
+        # Match and transfer materials using FileID -> mesh name mapping
+        materials_transferred = 0
+        matched_sdk_objects = set()
+        unmatched_fileids = []
+
+        for fileid, sdk_objs in sdk_fileid_map.items():
+            # Get mesh names for this FileID from the GLB mapping
+            mesh_names = fileid_to_meshnames.get(fileid, [])
+
+            if not mesh_names:
+                unmatched_fileids.append(hex(fileid))
+                continue
+
+            # Find filediver objects matching these mesh names
+            for sdk_obj in sdk_objs:
+                best_match = None
+                best_match_name = None
+
+                # Try to find a matching filediver object by exact name
+                for mesh_name in mesh_names:
+                    if mesh_name in filediver_name_map:
+                        best_match = filediver_name_map[mesh_name]
+                        best_match_name = mesh_name
+                        break
+
+                # Fallback 1: try basename map (handles Blender's .001 suffix from naming conflicts)
+                if best_match is None:
+                    for mesh_name in mesh_names:
+                        if mesh_name in filediver_basename_map:
+                            best_match = filediver_basename_map[mesh_name]
+                            best_match_name = mesh_name
+                            PrettyPrint(f"  Matched via basename: '{mesh_name}' -> '{best_match.name}'")
+                            break
+
+                # Fallback 2: try matching by vertex count if name matching fails
+                if best_match is None and sdk_obj.type == 'MESH' and sdk_obj.data:
+                    sdk_vert_count = len(sdk_obj.data.vertices)
+                    for mesh_name in mesh_names:
+                        if mesh_name in filediver_name_map:
+                            fd_obj = filediver_name_map[mesh_name]
+                            if fd_obj.type == 'MESH' and fd_obj.data:
+                                if len(fd_obj.data.vertices) == sdk_vert_count:
+                                    best_match = fd_obj
+                                    best_match_name = mesh_name
+                                    break
+                        # Also check basename map for vertex count fallback
+                        if mesh_name in filediver_basename_map:
+                            fd_obj = filediver_basename_map[mesh_name]
+                            if fd_obj.type == 'MESH' and fd_obj.data:
+                                if len(fd_obj.data.vertices) == sdk_vert_count:
+                                    best_match = fd_obj
+                                    best_match_name = mesh_name
+                                    break
+
+                if best_match is None:
+                    PrettyPrint(f"No filediver match for FileID {hex(fileid)} ({sdk_obj.name})")
+                    continue
+
+                # Transfer materials from filediver object to SDK object
+                PrettyPrint(f"Transferring materials from '{best_match.name}' to '{sdk_obj.name}' (FileID: {hex(fileid)})")
+
+                # Clear existing materials on SDK object
+                sdk_obj.data.materials.clear()
+
+                # Copy materials from filediver object
+                for mat_slot in best_match.material_slots:
+                    if mat_slot.material:
+                        sdk_obj.data.materials.append(mat_slot.material)
+                        materials_transferred += 1
+
+                # Copy UV layers that exist on filediver but not SDK (e.g., "UVs for Baking")
+                # This is needed for the HD2 shader to work correctly
+                sdk_mesh = sdk_obj.data
+                fd_mesh = best_match.data
+                if len(sdk_mesh.loops) == len(fd_mesh.loops):
+                    for fd_uv in fd_mesh.uv_layers:
+                        if fd_uv.name not in sdk_mesh.uv_layers:
+                            sdk_mesh.uv_layers.new(name=fd_uv.name)
+                            sdk_uv = sdk_mesh.uv_layers[fd_uv.name]
+                            for i, loop in enumerate(sdk_uv.data):
+                                loop.uv = fd_uv.data[i].uv
+                            PrettyPrint(f"  Copied UV layer '{fd_uv.name}' ({len(sdk_uv.data)} coords)")
+
+                matched_sdk_objects.add(sdk_obj)
+
+                # Remove this filediver object from the name maps to avoid reuse
+                if best_match_name:
+                    if best_match_name in filediver_name_map:
+                        del filediver_name_map[best_match_name]
+                    if best_match_name in filediver_basename_map:
+                        del filediver_basename_map[best_match_name]
+
+        if unmatched_fileids:
+            PrettyPrint(f"No GLB mapping for FileIDs: {unmatched_fileids}")
+
+        PrettyPrint(f"Transferred materials to {len(matched_sdk_objects)} SDK objects ({materials_transferred} material slots)")
+
+        # Check setting to keep or delete filediver objects
+        keep_filediver = context.scene.Hd2ToolPanelSettings.KeepFilediverObjects
+
+        if keep_filediver:
+            # Keep filediver objects for debugging (link them to scene)
+            filediver_collection_name = "Filediver_Import"
+            if filediver_collection_name not in bpy.data.collections:
+                filediver_collection = bpy.data.collections.new(filediver_collection_name)
+                context.scene.collection.children.link(filediver_collection)
+            else:
+                filediver_collection = bpy.data.collections[filediver_collection_name]
+
+            for obj in filediver_objects:
+                filediver_collection.objects.link(obj)
+
+            PrettyPrint(f"Kept {len(filediver_objects)} filediver objects in '{filediver_collection_name}' collection")
+        else:
+            # Clean up filediver objects (we only needed them for materials)
+            for obj in filediver_objects:
+                if obj.type == 'MESH' and obj.data and obj.data.users == 1:
+                    mesh_data = obj.data
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                    bpy.data.meshes.remove(mesh_data)
+                else:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+            PrettyPrint(f"Cleaned up {len(filediver_objects)} filediver objects")
+
+        PrettyPrint(f"Imported {len([m for m in data_to.materials if m])} materials, "
+                    f"{len([n for n in data_to.node_groups if n])} node groups, "
+                    f"{len([i for i in data_to.images if i])} textures")
+
+    def _create_simplebake_local_presets(self, context):
+        """Create SimpleBake local (blend file) presets for HD2 material types.
+
+        These presets configure SimpleBake with appropriate settings for baking
+        HD2 shader materials to different texture configurations.
+        """
+        try:
+            # Check if SimpleBake is installed
+            sbp = getattr(context.scene, 'SimpleBake_Props', None)
+            if sbp is None:
+                PrettyPrint("SimpleBake not installed, skipping preset creation")
+                return
+        except:
+            PrettyPrint("SimpleBake not available, skipping preset creation")
+            return
+
+        # Base preset settings shared by all HD2 presets
+        def get_base_preset():
+            return {
+                "global_mode": "PBR",
+                "ray_distance": 0.0,
+                "cage_and_ray_multiplier": 0.1,
+                "cage_extrusion": 0.0,
+                "auto_match_mode": "name",
+                "selected_s2a": False,
+                "s2a_opmode": "single",
+                "merged_bake": False,
+                "merged_bake_name": "Merged",
+                "cycles_s2a": False,
+                "imgheight": 2048,
+                "imgwidth": 2048,
+                "outputheight": 2048,
+                "outputwidth": 2048,
+                "everything32bitfloat": False,
+                "use_alpha": False,
+                "rough_glossy_switch": "Roughness",
+                "ccrough_glossy_switch": "Clearcoat Roughness",
+                "multiply_diffuse_ao": "purediffuse",
+                "multiply_diffuse_ao_percent": 50,
+                "normal_format_switch": "OpenGL",
+                "tex_per_mat": False,
+                "selected_col": True,
+                "selected_metal": False,
+                "selected_rough": False,
+                "selected_normal": True,
+                "selected_trans": False,
+                "selected_transrough": False,
+                "selected_emission": False,
+                "selected_emission_strength": False,
+                "selected_sss": False,
+                "selected_sss_scale": False,
+                "selected_ssscol": False,
+                "selected_clearcoat": False,
+                "selected_clearcoat_rough": False,
+                "selected_specular": False,
+                "selected_alpha": False,
+                "selected_col_mats": False,
+                "selected_col_vertex": False,
+                "selected_ao": False,
+                "selected_thickness": False,
+                "selected_curvature": False,
+                "selected_lightmap": False,
+                "selected_displacement": False,
+                "lightmap_apply_colman": True,
+                "new_uv_option": False,
+                "prefer_existing_sbmap": False,
+                "new_uv_method": "SmartUVProject_Atlas",
+                "restore_orig_uv_map": True,
+                "uvpackmargin": 0.003,
+                "average_uv_size": False,
+                "expand_mat_uvs": False,
+                "auto_detect_udims": True,
+                "unwrapmargin": 0.0,
+                "uvcorrectaspect": True,
+                "channelpackfileformat": "PNG",
+                "del_cptex_components": False,
+                "save_bakes_external": False,
+                "export_folder_per_object": False,
+                "export_mesh_individual_or_combined": "individual",
+                "export_format": "fbx",
+                "jpeg_quality": 90,
+                "save_obj_external": False,
+                "merge_export_obj": False,
+                "mesh_export_name": "Mesh",
+                "copy_and_apply": True,
+                "apply_bakes_to_original": False,
+                "hide_source_objects": True,
+                "hide_cage_object": True,
+                "preserve_materials": False,
+                "everything_16bit": False,
+                "export_file_format": "PNG",
+                "apply_col_man_to_col": True,
+                "export_cycles_col_space": True,
+                "rundenoise": False,
+                "apply_mods_on_mesh_export": True,
+                "objects_list_index": 0,
+                "bgbake": "fg",
+                "memLimit": "4096",
+                "batch_name": "",
+                "first_texture_show": True,
+                "bgbake_name": "",
+                "apply_transformation": True,
+                "create_glTF_node": False,
+                "glTF_selection": "Ambient Occlusion",
+                "export_path": "",
+                "move_new_uvs_to_top": False,
+                "selected_bump": False,
+                "cyclesbake_cs": "Non-Color",
+                "export_mesh_preset_name": "None",
+                "cyclesbake_copy_and_apply_mat_format": "emission",
+                "clear_image": True,
+                "cage_smooth_hard": "smooth",
+                "boosted_sample_count": 128,
+                "no_force_32bit_normals": False,
+                "keep_internal_after_export": True,
+                "ao_sample_count": 32,
+                "isolate_objects": False,
+                "uv_advanced_packing_show": False,
+                "uvp_shape_method": "CONCAVE",
+                "uvp_scale": True,
+                "uvp_rotate": True,
+                "uvp_rotation_method": "ANY",
+                "uvp_margin_method": "ADD",
+                "uvp_lock_pinned": False,
+                "uvp_lock_method": "LOCKED",
+                "uvp_merge_overlapping": True,
+                "uvp_pack_to": "ACTIVE_UDIM",
+                "showtips": True,
+                "presets_show": True,
+                "bake_objects_show": True,
+                "pbr_settings_show": True,
+                "aov_settings_show": False,
+                "cyclesbake_settings_show": False,
+                "specials_show": False,
+                "textures_show": True,
+                "export_show": True,
+                "admin_settings_show": False,
+                "uv_show": True,
+                "other_show": False,
+                "channelpacking_show": True,
+                "bg_status_show": False,
+                "bake_sequence": False,
+                "bake_sequence_start_frame": 1,
+                "bake_sequence_end_frame": 250,
+                "findreplace_find": "",
+                "findreplace_replace": "",
+                "findreplace_type": "object",
+                "do_aa": False,
+                "aa_threshold": 0.1,
+                "aa_contrast_limit": 0.5,
+                "aa_corner_radius": 2,
+                "cycles.bake_type": "COMBINED",
+                "render.bake.use_pass_direct": True,
+                "render.bake.use_pass_indirect": True,
+                "render.bake.use_pass_diffuse": True,
+                "render.bake.use_pass_glossy": True,
+                "render.bake.use_pass_transmission": True,
+                "render.bake.use_pass_emit": True,
+                "render.bake.view_from": "ABOVE_SURFACE",
+                "cycles.samples": 128,
+                "render.bake.normal_space": "TANGENT",
+                "render.bake.normal_r": "POS_X",
+                "render.bake.normal_g": "POS_Y",
+                "render.bake.normal_b": "POS_Z",
+                "render.bake.use_pass_color": True,
+                "render.bake.margin": 16,
+                "render.bake.margin_type": "EXTEND",
+                "render.image_settings.exr_codec": "ZIP",
+                "cycles.use_denoising": False,
+                "cycles.denoiser": "OPENIMAGEDENOISE",
+                "cycles.denoising_input_passes": "RGB_ALBEDO_NORMAL",
+                "cycles.denoising_prefilter": "ACCURATE",
+                "objects_list": [],
+                "pbr_target_obj": None,
+                "cycles_target_obj": None,
+                "cage_object": None,
+            }
+
+        # Define presets
+        presets = {}
+
+        # HD2 Basic+ - Color, Normal, Metallic, Roughness, AO with PBR channel pack
+        preset = get_base_preset()
+        preset["selected_col"] = True
+        preset["selected_metal"] = True
+        preset["selected_rough"] = True
+        preset["selected_normal"] = True
+        preset["selected_ao"] = True
+        preset["channel_packed_images"] = {
+            "PBR": {"R": "Metalness", "G": "Roughness", "B": "Ambient Occlusion", "A": "white",
+                    "file_format": "PNG", "exr_codec": "ZIP", "png_compression": 15}
+        }
+        presets["HD2 Basic+"] = preset
+
+        # HD2 Basic - Color, Normal, Metallic, Roughness, AO with PBR channel pack
+        preset = get_base_preset()
+        preset["selected_col"] = True
+        preset["selected_metal"] = True
+        preset["selected_rough"] = True
+        preset["selected_normal"] = True
+        preset["selected_ao"] = True
+        preset["channel_packed_images"] = {
+            "PBR": {"R": "Metalness", "G": "Roughness", "B": "Ambient Occlusion", "A": "white",
+                    "file_format": "PNG", "exr_codec": "ZIP", "png_compression": 15}
+        }
+        presets["HD2 Basic"] = preset
+
+        # HD2 Emissive - Color, Normal, Metallic, Roughness, AO, Emission
+        preset = get_base_preset()
+        preset["selected_col"] = True
+        preset["selected_metal"] = True
+        preset["selected_rough"] = True
+        preset["selected_normal"] = True
+        preset["selected_ao"] = True
+        preset["selected_emission"] = True
+        preset["channel_packed_images"] = {
+            "PBR": {"R": "Metalness", "G": "Roughness", "B": "Ambient Occlusion", "A": "none",
+                    "file_format": "PNG", "exr_codec": "ZIP", "png_compression": 15}
+        }
+        presets["HD2 Emissive"] = preset
+
+        # HD2 Translucent - Color, Normal, Roughness, Transmission
+        preset = get_base_preset()
+        preset["selected_col"] = True
+        preset["selected_rough"] = True
+        preset["selected_normal"] = True
+        preset["selected_trans"] = True
+        preset["channel_packed_images"] = {}
+        presets["HD2 Translucent"] = preset
+
+        # HD2 Advanced - Full PBR
+        preset = get_base_preset()
+        preset["selected_col"] = True
+        preset["selected_metal"] = True
+        preset["selected_rough"] = True
+        preset["selected_normal"] = True
+        preset["selected_ao"] = True
+        preset["selected_emission"] = True
+        preset["selected_specular"] = True
+        preset["selected_clearcoat"] = True
+        preset["selected_clearcoat_rough"] = True
+        preset["selected_alpha"] = True
+        preset["channel_packed_images"] = {
+            "PBR": {"R": "Metalness", "G": "Roughness", "B": "Ambient Occlusion", "A": "none",
+                    "file_format": "PNG", "exr_codec": "ZIP", "png_compression": 15},
+            "Clearcoat": {"R": "Clearcoat", "G": "Clearcoat Roughness", "B": "none", "A": "none",
+                          "file_format": "PNG", "exr_codec": "ZIP", "png_compression": 15}
+        }
+        presets["HD2 Advanced"] = preset
+
+        # Save presets to SimpleBake local presets
+        presets_created = 0
+        for name, preset_data in presets.items():
+            try:
+                key = f"SB_local_preset_{name}"
+                # Only create if not already exists (don't overwrite user changes)
+                if key not in sbp.keys():
+                    sbp[key] = json.dumps(preset_data)
+                    presets_created += 1
+            except Exception as e:
+                PrettyPrint(f"Failed to create SimpleBake preset '{name}': {e}", 'WARNING')
+
+        # Refresh the local presets list
+        if presets_created > 0:
+            try:
+                bpy.ops.simplebake.local_preset_refresh()
+            except:
+                pass
+            PrettyPrint(f"Created {presets_created} SimpleBake local presets for HD2 materials")
+
+    def _add_objects_to_simplebake_list(self, context, objects):
+        """Add objects to SimpleBake's bake objects list.
+
+        Args:
+            context: Blender context
+            objects: List of Blender objects to add to the bake list
+        """
+        try:
+            sbp = getattr(context.scene, 'SimpleBake_Props', None)
+            if sbp is None:
+                return
+        except:
+            return
+
+        # First, clean up stale entries (objects that no longer exist in scene)
+        scene_object_names = {obj.name for obj in context.scene.objects}
+        indices_to_remove = []
+        for i, item in enumerate(sbp.objects_list):
+            if item.name not in scene_object_names or item.obj_point is None:
+                indices_to_remove.append(i)
+
+        # Remove in reverse order to preserve indices
+        removed_count = 0
+        for i in reversed(indices_to_remove):
+            sbp.objects_list.remove(i)
+            removed_count += 1
+
+        if removed_count > 0:
+            PrettyPrint(f"Cleaned up {removed_count} stale objects from SimpleBake bake list")
+
+        # Get mesh objects only
+        mesh_objects = [obj for obj in objects if obj and obj.type == 'MESH']
+        if not mesh_objects:
+            return
+
+        # Add new objects (avoid duplicates)
+        added_count = 0
+        for obj in mesh_objects:
+            existing_names = [item.name for item in sbp.objects_list]
+            if obj.name not in existing_names:
+                item = sbp.objects_list.add()
+                item.name = obj.name
+                item.obj_point = obj
+                added_count += 1
+
+        PrettyPrint(f"Added {added_count} objects to SimpleBake bake list (total: {len(sbp.objects_list)})")
+
+
+# Texture packing configurations for each material type
+# Maps material template -> list of (texture_slot_name, channels_config)
+# channels_config is a dict mapping RGBA channel -> (bake_output, source_channel or None for grayscale)
+BAKE_TEXTURE_CONFIG = {
+    "basic+": [
+        # Slot 0: PBR texture - Metallic(R), Roughness(G), White(B), 1.0(A)
+        # Basic+ uses fully white B channel (not AO) for best results
+        ("PBR", {
+            'R': ("Bake_Metallic", None),
+            'G': ("Bake_Roughness", None),
+            'B': ("constant", 1.0),  # Basic+ requires white, not AO
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM"),
+        # Slot 1: Base Color
+        ("Base Color", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM_SRGB"),
+        # Slot 2: Normal
+        ("Normal", {
+            'R': ("Bake_Normal", 'R'),
+            'G': ("Bake_Normal", 'G'),
+            'B': ("constant", 1.0),  # Normal maps typically have B=1 for up direction
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM"),
+    ],
+    "basic": [
+        ("PBR", {
+            'R': ("Bake_Metallic", None),
+            'G': ("Bake_Roughness", None),
+            'B': ("Bake_Ambient Occlusion", None),
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM"),
+        ("Base Color", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM_SRGB"),
+        ("Normal", {
+            'R': ("Bake_Normal", 'R'),
+            'G': ("Bake_Normal", 'G'),
+            'B': ("constant", 1.0),
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM"),
+    ],
+    "emissive": [
+        # Slot 0: Normal/AO/Roughness - NormalR(R), NormalG(G), AO(B), Roughness(A)
+        ("Normal/AO/Roughness", {
+            'R': ("Bake_Normal", 'R'),
+            'G': ("Bake_Normal", 'G'),
+            'B': ("Bake_Ambient Occlusion", None),
+            'A': ("Bake_Roughness", None),
+        }, "BC7_UNORM"),
+        # Slot 1: Emission (use color as emission for now)
+        ("Emission", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM_SRGB"),
+        # Slot 2: Base Color/Metallic
+        ("Base Color/Metallic", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("Bake_Metallic", None),
+        }, "BC7_UNORM_SRGB"),
+    ],
+    "alphaclip": [
+        ("Normal/AO/Roughness", {
+            'R': ("Bake_Normal", 'R'),
+            'G': ("Bake_Normal", 'G'),
+            'B': ("Bake_Ambient Occlusion", None),
+            'A': ("Bake_Roughness", None),
+        }, "BC7_UNORM"),
+        ("Alpha Mask", {
+            'R': ("Bake_Alpha", None),
+            'G': ("Bake_Alpha", None),
+            'B': ("Bake_Alpha", None),
+            'A': ("Bake_Alpha", None),
+        }, "BC4_UNORM"),
+        ("Base Color/Metallic", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("Bake_Metallic", None),
+        }, "BC7_UNORM_SRGB"),
+    ],
+    "alphaclip+": [
+        ("Normal/AO/Roughness", {
+            'R': ("Bake_Normal", 'R'),
+            'G': ("Bake_Normal", 'G'),
+            'B': ("Bake_Ambient Occlusion", None),
+            'A': ("Bake_Roughness", None),
+        }, "BC7_UNORM"),
+        ("Emission", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM_SRGB"),
+        ("Base Color/Metallic", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("Bake_Metallic", None),
+        }, "BC7_UNORM_SRGB"),
+        ("Alpha Mask", {
+            'R': ("Bake_Alpha", None),
+            'G': ("Bake_Alpha", None),
+            'B': ("Bake_Alpha", None),
+            'A': ("Bake_Alpha", None),
+        }, "BC4_UNORM"),
+    ],
+    "advanced": [
+        # Advanced has a complex 11-slot layout, we'll fill the key ones
+        # Slot 0-1: empty
+        # Slot 2: Normal/AO/Roughness
+        ("", None, None),  # Slot 0 - empty
+        ("", None, None),  # Slot 1 - empty
+        ("Normal/AO/Roughness", {
+            'R': ("Bake_Normal", 'R'),
+            'G': ("Bake_Normal", 'G'),
+            'B': ("Bake_Ambient Occlusion", None),
+            'A': ("Bake_Roughness", None),
+        }, "BC7_UNORM"),
+        # Slot 3: Metallic
+        ("Metallic", {
+            'R': ("Bake_Metallic", None),
+            'G': ("Bake_Metallic", None),
+            'B': ("Bake_Metallic", None),
+            'A': ("constant", 1.0),
+        }, "BC4_UNORM"),
+        ("", None, None),  # Slot 4 - empty
+        # Slot 5: Color/Emission Mask
+        ("Color/Emission Mask", {
+            'R': ("Bake_Color", 'R'),
+            'G': ("Bake_Color", 'G'),
+            'B': ("Bake_Color", 'B'),
+            'A': ("constant", 1.0),  # Emission mask - 1.0 = full emission
+        }, "BC7_UNORM_SRGB"),
+        ("", None, None),  # Slot 6 - empty
+        ("", None, None),  # Slot 7 - empty
+        ("", None, None),  # Slot 8 - empty
+        ("", None, None),  # Slot 9 - empty
+        ("", None, None),  # Slot 10 - empty
+    ],
+    "translucent": [
+        ("Normal", {
+            'R': ("Bake_Normal", 'R'),
+            'G': ("Bake_Normal", 'G'),
+            'B': ("constant", 1.0),
+            'A': ("constant", 1.0),
+        }, "BC7_UNORM"),
+    ],
+}
+
+
+class SaveMeshWithBakedTexturesOperator(Operator):
+    """Bake HD2 shader textures and save mesh with a simplified material template"""
+    bl_label = "Bake & Save"
+    bl_idname = "helldiver2.save_mesh_baked_textures"
+    bl_description = "Bake textures from HD2 Shader and save with selected material type"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # Material type selection
+    material_type: EnumProperty(
+        name="Material Type",
+        description="Target material type for baked textures",
+        items=[
+            ("basic+", "Basic+", "Basic material with color, normal, and PBR. Renders in UI."),
+            ("basic", "Basic", "Basic material with color, normal, and PBR."),
+            ("emissive", "Emissive", "Material with color, normal, and emission map."),
+            ("alphaclip", "Alpha Clip", "Material with alpha mask support. Does not render in UI."),
+            ("alphaclip+", "Alpha Clip+", "Alpha mask with emission support."),
+            ("advanced", "Advanced", "Complex material with color, normal, emission and PBR. Renders in UI."),
+            ("translucent", "Translucent", "Translucent material with normal map only."),
+        ],
+        default="basic+"
+    )
+
+    bake_resolution: EnumProperty(
+        name="Resolution",
+        description="Resolution for baked textures",
+        items=[
+            ("256", "256x256", "Low resolution"),
+            ("512", "512x512", "Medium resolution"),
+            ("1024", "1024x1024", "High resolution (recommended)"),
+            ("2048", "2048x2048", "Very high resolution"),
+            ("4096", "4096x4096", "Ultra resolution"),
+        ],
+        default="1024"
+    )
+
+    bake_samples: IntProperty(
+        name="Samples",
+        description="Number of samples for baking (higher = better quality but slower)",
+        default=16,
+        min=1,
+        max=256
+    )
+
+    object_id: StringProperty(options={"HIDDEN"})
+
+    # Internal state for two-stage process
+    _stage: str = "settings"  # "settings" -> "confirm"
+    _processed_objects: list = []  # List of (obj, original_materials, material_id, object_id)
+
+    def invoke(self, context, event):
+        self._stage = "settings"
+        self._processed_objects = []
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+
+        if self._stage == "settings":
+            layout.prop(self, "material_type")
+            layout.prop(self, "bake_resolution")
+            layout.prop(self, "bake_samples")
+
+            # Show texture slots that will be created
+            layout.separator()
+            layout.label(text="Textures to be created:")
+            if self.material_type in BAKE_TEXTURE_CONFIG:
+                for slot_name, channels, fmt in BAKE_TEXTURE_CONFIG[self.material_type]:
+                    if slot_name and channels:
+                        layout.label(text=f"  • {slot_name}", icon='TEXTURE')
+
+        elif self._stage == "confirm":
+            layout.label(text="Preview the baked materials on your objects.", icon='QUESTION')
+            layout.label(text="Does everything look correct?")
+            layout.separator()
+            layout.label(text="Click OK to save the mesh with baked textures.")
+            layout.label(text="Click Cancel (or press Escape) to revert.")
+
+    def execute(self, context):
+        if self._stage == "settings":
+            # Stage 1: Do the baking and swap materials for preview
+            return self._execute_bake(context)
+        elif self._stage == "confirm":
+            # Stage 2: User confirmed, save the mesh
+            return self._execute_save(context)
+        return {'CANCELLED'}
+
+    def cancel(self, context):
+        # User cancelled during confirmation - revert materials
+        if self._stage == "confirm":
+            self._revert_materials()
+            self.report({'INFO'}, "Bake cancelled - materials reverted")
+
+    def _execute_bake(self, context):
+        """Stage 1: Bake textures and swap materials for preview"""
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        # Get selected objects
+        selected_objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected_objects:
+            self.report({'ERROR'}, "No mesh objects selected")
+            return {'CANCELLED'}
+
+        # Filter to objects with HD2 Shader materials
+        valid_objects = []
+        for obj in selected_objects:
+            if self._has_hd2_shader(obj):
+                valid_objects.append(obj)
+            else:
+                PrettyPrint(f"Skipping {obj.name}: no HD2 Shader found", 'WARNING')
+
+        if not valid_objects:
+            self.report({'ERROR'}, "No selected objects have HD2 Shader materials. Import with 'With Shader' first.")
+            return {'CANCELLED'}
+
+        # Process each object - bake and swap materials for preview
+        self._processed_objects = []
+        for obj in valid_objects:
+            try:
+                result = self._bake_and_preview(context, obj)
+                if result:
+                    self._processed_objects.append(result)
+            except Exception as e:
+                PrettyPrint(f"Failed to process {obj.name}: {str(e)}", 'ERROR')
+                import traceback
+                traceback.print_exc()
+
+        if not self._processed_objects:
+            self.report({'ERROR'}, "Failed to bake any meshes")
+            return {'CANCELLED'}
+
+        # Show confirmation dialog
+        self._stage = "confirm"
+        self.report({'INFO'}, f"Baked {len(self._processed_objects)} object(s). Check the preview and confirm.")
+        return context.window_manager.invoke_props_dialog(self, width=350)
+
+    def _execute_save(self, context):
+        """Stage 2: User confirmed - save meshes with baked materials"""
+        success_count = 0
+        for obj, original_materials, material_id, object_id in self._processed_objects:
+            try:
+                if obj.name not in bpy.data.objects:
+                    PrettyPrint(f"Object no longer exists, skipping", 'WARNING')
+                    continue
+
+                # Save the mesh with the new material
+                self._save_mesh_with_material(context, obj, object_id, material_id)
+                success_count += 1
+                PrettyPrint(f"Saved {obj.name} with baked material")
+            except Exception as e:
+                PrettyPrint(f"Failed to save {obj.name}: {str(e)}", 'ERROR')
+                import traceback
+                traceback.print_exc()
+
+        self._processed_objects = []
+
+        if success_count > 0:
+            self.report({'INFO'}, f"Successfully saved {success_count} mesh(es) with baked textures")
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, "Failed to save any meshes")
+            return {'CANCELLED'}
+
+    def _revert_materials(self):
+        """Revert all objects to their original materials"""
+        for obj, original_materials, material_id, object_id in self._processed_objects:
+            try:
+                if obj.name not in bpy.data.objects:
+                    continue
+                # Restore original materials
+                obj.data.materials.clear()
+                for mat in original_materials:
+                    obj.data.materials.append(mat)
+                PrettyPrint(f"Reverted materials on {obj.name}")
+            except Exception as e:
+                PrettyPrint(f"Failed to revert {obj.name}: {str(e)}", 'WARNING')
+        self._processed_objects = []
+
+    def _has_hd2_shader(self, obj):
+        """Check if object has a material with HD2 Shader node group"""
+        return has_hd2_shader(obj)
+
+    def _find_hd2_shader_node(self, material):
+        """Find the HD2 Shader node group in a material"""
+        return find_hd2_shader_node(material)
+
+    def _bake_and_preview(self, context, obj):
+        """Bake textures, create material, and swap for preview. Returns (obj, original_mats, material_id, object_id)"""
+        PrettyPrint(f"Processing object: {obj.name}")
+
+        # Get object ID
+        try:
+            object_id = obj["Z_ObjectID"]
+        except KeyError:
+            raise Exception(f"Object {obj.name} has no Z_ObjectID property")
+
+        # Get the first material with HD2 Shader
+        hd2_mat = None
+        hd2_shader_node = None
+        for mat in obj.data.materials:
+            shader_node = self._find_hd2_shader_node(mat)
+            if shader_node:
+                hd2_mat = mat
+                hd2_shader_node = shader_node
+                break
+
+        if not hd2_shader_node:
+            raise Exception(f"No HD2 Shader found in {obj.name}")
+
+        # Store original materials for potential revert
+        original_materials = list(obj.data.materials)
+
+        # Select only this object for baking
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        # Step 1: Bake all required textures from HD2 Shader
+        PrettyPrint("Step 1: Baking textures from HD2 Shader...")
+        baked_images = self._bake_textures(context, obj, hd2_mat, hd2_shader_node)
+
+        # Step 2: Pack channels according to material type config
+        PrettyPrint("Step 2: Packing texture channels...")
+        packed_textures = self._pack_textures(context, baked_images, obj.name)
+
+        # Clean up baked images (no longer needed after packing)
+        for img in baked_images.values():
+            if img:
+                bpy.data.images.remove(img)
+
+        # Step 3: Create modded material with baked textures
+        PrettyPrint("Step 3: Creating material with baked textures...")
+        material_id = self._create_material_with_baked_textures(context, packed_textures)
+
+        # Step 4: Create a preview Blender material and assign it to the object
+        PrettyPrint("Step 4: Swapping to preview material...")
+        self._swap_to_preview_material(context, obj, material_id)
+
+        PrettyPrint(f"Baked and ready for preview: {obj.name}")
+        return (obj, original_materials, material_id, object_id)
+
+    def _bake_textures(self, context, obj, material, shader_node):
+        """Bake all required outputs from the HD2 Shader using HD2Baker.
+
+        Uses the HD2Baker class which provides cleaner node management and
+        proper cleanup based on Principled Baker techniques.
+        """
+        resolution = int(self.bake_resolution)
+
+        # Create baker instance
+        baker = HD2Baker(context)
+        baker.resolution = resolution
+        baker.samples = self.bake_samples
+        baker.use_gpu = True
+
+        # Bake all outputs
+        PrettyPrint(f"Baking textures using HD2Baker (resolution: {resolution}, samples: {self.bake_samples})...")
+        results = baker.bake_object(obj)
+
+        # Convert keys to match BAKE_TEXTURE_CONFIG format (e.g., "Color" -> "Bake_Color")
+        baked_images = {}
+        for key, image in results.items():
+            bake_key = f"Bake_{key}"
+            baked_images[bake_key] = image
+            PrettyPrint(f"Baked {bake_key}")
+
+        return baked_images
+
+    def _pack_textures(self, context, baked_images, obj_name):
+        """Pack baked textures into channel configurations for target material type"""
+        config = BAKE_TEXTURE_CONFIG.get(self.material_type, [])
+        packed_textures = []
+        resolution = int(self.bake_resolution)
+
+        for slot_name, channels, dds_format in config:
+            if not slot_name or not channels:
+                packed_textures.append(None)
+                continue
+
+            # Create new image for packed result
+            packed_img = bpy.data.images.new(f"packed_{slot_name}_{obj_name}", resolution, resolution, alpha=True)
+
+            # Get pixel data from source images
+            pixels = [0.0] * (resolution * resolution * 4)
+
+            for channel_idx, channel_name in enumerate(['R', 'G', 'B', 'A']):
+                source_info = channels.get(channel_name)
+                if not source_info:
+                    continue
+
+                source_output, source_channel = source_info
+
+                if source_output == "constant":
+                    # Fill with constant value
+                    value = source_channel
+                    for i in range(resolution * resolution):
+                        pixels[i * 4 + channel_idx] = value
+                elif source_output in baked_images:
+                    source_img = baked_images[source_output]
+                    source_pixels = list(source_img.pixels)
+
+                    if source_channel is None:
+                        # Use as grayscale (R channel)
+                        for i in range(resolution * resolution):
+                            pixels[i * 4 + channel_idx] = source_pixels[i * 4]  # R channel
+                    else:
+                        # Use specific channel
+                        src_channel_idx = {'R': 0, 'G': 1, 'B': 2, 'A': 3}[source_channel]
+                        for i in range(resolution * resolution):
+                            pixels[i * 4 + channel_idx] = source_pixels[i * 4 + src_channel_idx]
+                else:
+                    # Source not available, use default
+                    default_val = 0.5 if channel_name in ['R', 'G', 'B'] else 1.0
+                    for i in range(resolution * resolution):
+                        pixels[i * 4 + channel_idx] = default_val
+
+            packed_img.pixels = pixels
+            packed_textures.append((packed_img, slot_name, dds_format))
+
+        return packed_textures
+
+    def _create_material_with_baked_textures(self, context, packed_textures):
+        """Create modded material with baked textures.
+
+        This converts baked textures to DDS, creates a material from template,
+        then directly overwrites the texture entries with our baked DDS files
+        (similar to using 'Import DDS Texture' from the UI).
+        """
+        template = self.material_type
+        tempdir = get_temp_folder()
+
+        # Step 1: Convert all packed textures to DDS files first
+        dds_paths = []
+        for i, item in enumerate(packed_textures):
+            if item is None:
+                dds_paths.append(None)
+                continue
+
+            packed_img, slot_name, dds_format = item
+
+            PrettyPrint(f"Converting baked texture {i}: {slot_name} to DDS...")
+
+            # Save packed image as TGA
+            tga_path = os.path.join(tempdir, f"bake_{slot_name.replace('/', '_')}.tga")
+            packed_img.file_format = 'TARGA_RAW'
+            packed_img.filepath_raw = tga_path
+            packed_img.save()
+
+            # Convert to DDS
+            dds_path = os.path.join(tempdir, f"bake_{slot_name.replace('/', '_')}.dds")
+            subprocess.run([
+                Global_texconvpath, "-y", "-o", tempdir,
+                "-ft", "dds", "-dx10", "-f", dds_format,
+                "-sepalpha", "-alpha", tga_path
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+            if not os.path.exists(dds_path):
+                PrettyPrint(f"DDS conversion failed for {slot_name}", 'ERROR')
+                dds_paths.append(None)
+            else:
+                dds_paths.append(dds_path)
+                PrettyPrint(f"Created DDS: {dds_path}")
+
+            # Clean up blender image
+            bpy.data.images.remove(packed_img)
+
+        # Step 2: Create modded material from template (this also saves it with template textures)
+        CreateModdedMaterial(template)
+
+        # Find the newly created material entry
+        material_entries = []
+        for entry in Global_TocManager.ActivePatch.TocDict.get(MaterialID, {}).values():
+            if entry.IsCreated and entry.MaterialTemplate == template:
+                material_entries.append(entry)
+
+        if not material_entries:
+            raise Exception("Failed to create material entry")
+
+        mat_entry = material_entries[-1]
+        PrettyPrint(f"Created material entry {mat_entry.FileID}")
+
+        # Step 3: Load the material to get texture IDs
+        if not mat_entry.IsLoaded:
+            mat_entry.Load()
+        mat = mat_entry.LoadedData
+
+        # Step 4: Create texture entries by copying template textures and replacing with our DDS data
+        # (this mirrors how "Import DDS" works - load existing texture, replace data, save)
+        PrettyPrint("Creating texture entries from baked DDS files...")
+        new_tex_ids = []
+        for i, dds_path in enumerate(dds_paths):
+            if dds_path is None:
+                new_tex_ids.append(mat.TexIDs[i] if i < len(mat.TexIDs) else 0)
+                continue
+
+            if i >= len(mat.TexIDs):
+                PrettyPrint(f"Skipping texture {i}: no template texture ID", 'WARNING')
+                continue
+
+            # Get the template texture ID and load it
+            template_tex_id = mat.TexIDs[i]
+            PrettyPrint(f"Loading template texture {template_tex_id} for slot {i}")
+
+            # Load the template texture entry
+            Global_TocManager.Load(int(template_tex_id), TexID, False, True)
+            template_entry = Global_TocManager.GetEntry(int(template_tex_id), TexID, True)
+
+            if template_entry is None:
+                PrettyPrint(f"Could not find template texture {template_tex_id}, skipping", 'ERROR')
+                new_tex_ids.append(template_tex_id)
+                continue
+
+            # Load the template texture data
+            template_entry.Load()
+            StingrayTex = template_entry.LoadedData
+
+            # Replace with our baked DDS data (just like Import DDS does)
+            PrettyPrint(f"Replacing texture data with {dds_path}")
+            with open(dds_path, 'rb') as f:
+                StingrayTex.FromDDS(f.read())
+
+            # Serialize to binary
+            Toc = MemoryStream(IOMode="write")
+            Gpu = MemoryStream(IOMode="write")
+            Stream = MemoryStream(IOMode="write")
+            StingrayTex.Serialize(Toc, Gpu, Stream)
+
+            # Generate a new ID for this texture
+            tex_id = RandomHash16()
+            PrettyPrint(f"Creating texture {i} with new ID {tex_id}")
+
+            # Create new texture entry with the data
+            tex_entry = TocEntry()
+            tex_entry.FileID = tex_id
+            tex_entry.TypeID = TexID
+            tex_entry.IsCreated = True
+            tex_entry.SetData(Toc.Data, Gpu.Data, Stream.Data, False)
+
+            # Add to patch
+            Global_TocManager.AddNewEntryToPatch(tex_entry)
+            new_tex_ids.append(tex_id)
+            PrettyPrint(f"Added texture entry {tex_id} to patch")
+
+        # Step 5: Update material's TexIDs to point to our new textures
+        PrettyPrint(f"Updating material TexIDs from {mat.TexIDs} to {new_tex_ids}")
+        for i, tex_id in enumerate(new_tex_ids):
+            if i < len(mat.TexIDs):
+                mat.TexIDs[i] = tex_id
+
+        # Step 6: Save the material with updated TexIDs
+        PrettyPrint("Saving material with updated texture IDs...")
+        f = MemoryStream(IOMode="write")
+        mat.Serialize(f)
+        mat_entry.SetData(f.Data, b"", b"", False)
+
+        PrettyPrint(f"Created material {mat_entry.FileID} with template {template} and baked textures")
+        return mat_entry.FileID
+
+    def _swap_to_preview_material(self, context, obj, material_id):
+        """Swap the object's Blender materials to a preview material for user confirmation.
+
+        Creates a simple PBR material in Blender using the baked textures so the user
+        can see approximately what the result will look like before saving.
+        NOTE: Material name MUST be just the numeric ID for GetMeshData to work.
+        """
+        # Material name must be just the numeric ID for GetMeshData to parse it
+        mat_name = str(material_id)
+
+        # Always create a fresh preview material (remove old one if exists)
+        if mat_name in bpy.data.materials:
+            bpy.data.materials.remove(bpy.data.materials[mat_name])
+
+        # Create a new preview material
+        preview_mat = bpy.data.materials.new(name=mat_name)
+        preview_mat.use_nodes = True
+        nodes = preview_mat.node_tree.nodes
+        links = preview_mat.node_tree.links
+
+        # Clear default nodes
+        nodes.clear()
+
+        # Create Principled BSDF and output
+        output = nodes.new('ShaderNodeOutputMaterial')
+        output.location = (300, 0)
+        bsdf = nodes.new('ShaderNodeBsdfPrincipled')
+        bsdf.location = (0, 0)
+        links.new(bsdf.outputs['BSDF'], output.inputs['Surface'])
+
+        # Try to load the baked texture images
+        tempdir = get_temp_folder()
+        config = BAKE_TEXTURE_CONFIG.get(self.material_type, [])
+
+        for i, (slot_name, channels, dds_format) in enumerate(config):
+            if not slot_name or not channels:
+                continue
+
+            # Look for the TGA version of the texture (we save as TGA)
+            tga_path = os.path.join(tempdir, f"bake_{slot_name.replace('/', '_')}.tga")
+            PrettyPrint(f"Looking for preview texture: {tga_path}")
+
+            if os.path.exists(tga_path):
+                img = bpy.data.images.load(tga_path)
+                tex_node = nodes.new('ShaderNodeTexImage')
+                tex_node.image = img
+                tex_node.location = (-400, 200 - i * 300)
+
+                # Set correct colorspace based on texture type
+                # PBR and Normal contain linear data, Base Color is sRGB
+                if "Color" in slot_name or "Base" in slot_name:
+                    img.colorspace_settings.name = 'sRGB'
+                else:
+                    img.colorspace_settings.name = 'Non-Color'
+
+                # Connect based on slot type
+                if "Color" in slot_name or "Base" in slot_name:
+                    links.new(tex_node.outputs['Color'], bsdf.inputs['Base Color'])
+                elif "Normal" in slot_name:
+                    normal_map = nodes.new('ShaderNodeNormalMap')
+                    normal_map.location = (-150, 200 - i * 300)
+                    links.new(tex_node.outputs['Color'], normal_map.inputs['Color'])
+                    links.new(normal_map.outputs['Normal'], bsdf.inputs['Normal'])
+                elif "PBR" in slot_name:
+                    # PBR is packed: R=Metallic, G=Roughness, B=AO
+                    sep = nodes.new('ShaderNodeSeparateColor')
+                    sep.location = (-150, 200 - i * 300)
+                    links.new(tex_node.outputs['Color'], sep.inputs['Color'])
+                    links.new(sep.outputs['Red'], bsdf.inputs['Metallic'])
+                    links.new(sep.outputs['Green'], bsdf.inputs['Roughness'])
+            else:
+                PrettyPrint(f"Preview texture not found: {tga_path}", 'WARNING')
+
+        PrettyPrint(f"Created preview material: {mat_name}")
+
+        # Assign preview material to all slots on the object
+        if obj.data.materials:
+            for i in range(len(obj.data.materials)):
+                obj.data.materials[i] = preview_mat
+        else:
+            obj.data.materials.append(preview_mat)
+
+        PrettyPrint(f"Assigned preview material to {obj.name}")
+
+    def _save_mesh_with_material(self, context, obj, object_id, material_id):
+        """Save the mesh with the specified material ID."""
+        # Select only this object
+        bpy.ops.object.select_all(action='DESELECT')
+        obj.select_set(True)
+        context.view_layer.objects.active = obj
+
+        # Get settings
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+
+        # Get the entry and load it
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(object_id), UnitID)
+        if Entry is None:
+            raise Exception(f"Could not find entry for {object_id}")
+
+        Entry.Load(True, False, True)
+
+        # Add entry to patch
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(object_id))
+
+        # Get mesh data from Blender objects
+        MeshData = GetObjectsMeshData(Global_TocManager, Global_BoneNames)
+
+        # Get the mesh data for this object
+        ID = str(object_id)
+        if ID not in MeshData:
+            raise Exception(f"No mesh data found for ID {ID}")
+
+        meshes = MeshData[ID]
+
+        # Replace mesh data in entry
+        for mesh_index, mesh in meshes.items():
+            try:
+                Entry.LoadedData.RawMeshes[mesh_index] = mesh
+            except IndexError:
+                raise Exception(f"MeshInfoIndex {mesh_index} exceeds mesh count")
+
+        # Set all MaterialIDs to our baked material
+        if hasattr(Entry.LoadedData, 'MaterialIDs'):
+            for i in range(len(Entry.LoadedData.MaterialIDs)):
+                Entry.LoadedData.MaterialIDs[i] = material_id
+            PrettyPrint(f"Set all MaterialIDs to {material_id}")
+
+        # Save the entry
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+        if not wasSaved:
+            raise Exception(f"Failed to save mesh {object_id}")
+
+
 class SaveStingrayUnitOperator(Operator):
     bl_label  = "Save Unit"
     bl_idname = "helldiver2.archive_unit_save"
@@ -2761,6 +5055,949 @@ class SaveStingrayUnitOperator(Operator):
             return{'CANCELLED'}
         self.report({'INFO'}, f"Saved Unit Object ID: {self.object_id}")
         return{'FINISHED'}
+
+
+def modify_lod_data_for_always_visible(lod_data: bytearray, mode: str = 'zero') -> bytearray:
+    """
+    Modify LOD screen percentage thresholds to make a unit always visible.
+
+    Args:
+        lod_data: The UnreversedLODGroupListData bytearray
+        mode: 'zero' = set all thresholds to 0.0, 'tiny' = set to very small value
+
+    Returns:
+        Modified bytearray
+    """
+    import struct
+
+    if not lod_data or len(lod_data) < 4:
+        return lod_data
+
+    # Parse as float32 values
+    num_floats = len(lod_data) // 4
+    floats = list(struct.unpack(f'<{num_floats}f', lod_data[:num_floats * 4]))
+
+    # Find and modify LOD threshold values (typically small positive floats 0.0-1.0)
+    modified = False
+    for i, f in enumerate(floats):
+        # LOD thresholds are typically between 0.0 and 1.0 (screen percentage)
+        # Values like 0.01, 0.05, 0.1, 0.2 are common
+        if 0.0 < f <= 1.0:
+            if mode == 'zero':
+                floats[i] = 0.0
+            elif mode == 'tiny':
+                floats[i] = 1e-9  # Extremely small but not zero
+            modified = True
+            PrettyPrint(f"  LOD threshold [{i}]: {f:.6f} -> {floats[i]:.6f}")
+
+    if not modified:
+        PrettyPrint("  No LOD thresholds found in expected range (0.0-1.0)")
+
+    # Pack back to bytes
+    new_data = bytearray(struct.pack(f'<{num_floats}f', *floats))
+    # Preserve any remaining bytes after the float data
+    if len(lod_data) > num_floats * 4:
+        new_data.extend(lod_data[num_floats * 4:])
+
+    return new_data
+
+
+def expand_bounding_box(unk2_data: bytearray, scale: float = 100.0) -> bytearray:
+    """
+    Expand the bounding box in MeshInfo.unk2 to reduce frustum culling.
+
+    Args:
+        unk2_data: The 32-byte unk2 field (likely AABB: MinXYZ + pad + MaxXYZ + pad)
+        scale: How much to expand the bounding box
+
+    Returns:
+        Modified bytearray
+    """
+    import struct
+
+    if not unk2_data or len(unk2_data) != 32:
+        return unk2_data
+
+    # Parse as 8 float32 values: [MinX, MinY, MinZ, ?, MaxX, MaxY, MaxZ, ?]
+    floats = list(struct.unpack('<8f', unk2_data))
+
+    # Expand min values (make more negative) and max values (make more positive)
+    # Skip padding values (indices 3 and 7)
+    for i in [0, 1, 2]:  # Min XYZ
+        if floats[i] != 0.0:
+            floats[i] = floats[i] - abs(floats[i]) * scale
+        else:
+            floats[i] = -scale
+
+    for i in [4, 5, 6]:  # Max XYZ
+        if floats[i] != 0.0:
+            floats[i] = floats[i] + abs(floats[i]) * scale
+        else:
+            floats[i] = scale
+
+    return bytearray(struct.pack('<8f', *floats))
+
+
+class UnitLodValueOperator(Operator):
+    """Edit a single LOD threshold value"""
+    bl_label = "Edit LOD Value"
+    bl_idname = "helldiver2.unit_lod_value"
+    bl_description = "Edit this LOD threshold value"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+    value_index: IntProperty()
+    value: FloatProperty()
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=250)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "value", text="LOD Threshold")
+        layout.label(text="0.0 = always visible, 0.05 = 5% screen height", icon='INFO')
+
+    def execute(self, context):
+        import struct
+
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None:
+            self.report({'ERROR'}, f"Could not find entry for ID: {self.object_id}")
+            return {'CANCELLED'}
+
+        if not Entry.IsLoaded:
+            Entry.Load(True, False, True)
+
+        mesh_file = Entry.LoadedData
+        lod_data = mesh_file.UnreversedLODGroupListData
+
+        if not lod_data or len(lod_data) < 4:
+            self.report({'ERROR'}, "No LOD data found")
+            return {'CANCELLED'}
+
+        # Parse, modify, repack
+        num_floats = len(lod_data) // 4
+        floats = list(struct.unpack(f'<{num_floats}f', lod_data[:num_floats * 4]))
+
+        if self.value_index >= len(floats):
+            self.report({'ERROR'}, f"Invalid value index: {self.value_index}")
+            return {'CANCELLED'}
+
+        floats[self.value_index] = self.value
+        new_data = bytearray(struct.pack(f'<{num_floats}f', *floats))
+        if len(lod_data) > num_floats * 4:
+            new_data.extend(lod_data[num_floats * 4:])
+        mesh_file.UnreversedLODGroupListData = new_data
+
+        # Add to patch and save
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save unit")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Set LOD[{self.value_index}] = {self.value}")
+        return {'FINISHED'}
+
+
+class UnitBboxValueOperator(Operator):
+    """Edit bounding box values for a mesh"""
+    bl_label = "Edit Bounding Box"
+    bl_idname = "helldiver2.unit_bbox_value"
+    bl_description = "Edit the bounding box for this mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+    mesh_index: IntProperty()
+
+    min_x: FloatProperty(name="Min X")
+    min_y: FloatProperty(name="Min Y")
+    min_z: FloatProperty(name="Min Z")
+    max_x: FloatProperty(name="Max X")
+    max_y: FloatProperty(name="Max Y")
+    max_z: FloatProperty(name="Max Z")
+
+    def invoke(self, context, event):
+        import struct
+
+        # Load current values
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry and Entry.IsLoaded:
+            mesh_file = Entry.LoadedData
+            if self.mesh_index < len(mesh_file.MeshInfoArray):
+                mesh_info = mesh_file.MeshInfoArray[self.mesh_index]
+                if len(mesh_info.unk2) == 32:
+                    floats = struct.unpack('<8f', mesh_info.unk2)
+                    self.min_x, self.min_y, self.min_z = floats[0], floats[1], floats[2]
+                    self.max_x, self.max_y, self.max_z = floats[4], floats[5], floats[6]
+
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column()
+        col.label(text="Bounding Box (AABB)", icon='MESH_CUBE')
+        row = col.row()
+        row.prop(self, "min_x")
+        row.prop(self, "max_x")
+        row = col.row()
+        row.prop(self, "min_y")
+        row.prop(self, "max_y")
+        row = col.row()
+        row.prop(self, "min_z")
+        row.prop(self, "max_z")
+        layout.label(text="Larger bbox = less frustum culling", icon='INFO')
+
+    def execute(self, context):
+        import struct
+
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None:
+            self.report({'ERROR'}, f"Could not find entry for ID: {self.object_id}")
+            return {'CANCELLED'}
+
+        if not Entry.IsLoaded:
+            Entry.Load(True, False, True)
+
+        mesh_file = Entry.LoadedData
+        if self.mesh_index >= len(mesh_file.MeshInfoArray):
+            self.report({'ERROR'}, f"Invalid mesh index: {self.mesh_index}")
+            return {'CANCELLED'}
+
+        mesh_info = mesh_file.MeshInfoArray[self.mesh_index]
+        if len(mesh_info.unk2) != 32:
+            self.report({'ERROR'}, "Invalid bounding box data")
+            return {'CANCELLED'}
+
+        # Parse existing to preserve padding values
+        floats = list(struct.unpack('<8f', mesh_info.unk2))
+        floats[0], floats[1], floats[2] = self.min_x, self.min_y, self.min_z
+        floats[4], floats[5], floats[6] = self.max_x, self.max_y, self.max_z
+        mesh_info.unk2 = bytearray(struct.pack('<8f', *floats))
+
+        # Add to patch and save
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save unit")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Updated bounding box for mesh {self.mesh_index}")
+        return {'FINISHED'}
+
+
+class UnitHeaderValueOperator(Operator):
+    """Edit a value in UnkHeaderData1"""
+    bl_label = "Edit Header Value"
+    bl_idname = "helldiver2.unit_header_value"
+    bl_description = "Edit this header value"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+    field_name: StringProperty()
+    value_index: IntProperty()
+    value: FloatProperty()
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=250)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "value", text=f"{self.field_name}[{self.value_index}]")
+
+    def execute(self, context):
+        import struct
+
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None or not Entry.IsLoaded:
+            self.report({'ERROR'}, f"Could not find entry")
+            return {'CANCELLED'}
+
+        mesh_file = Entry.LoadedData
+        data = getattr(mesh_file, self.field_name, None)
+        if not data:
+            self.report({'ERROR'}, f"Field {self.field_name} not found")
+            return {'CANCELLED'}
+
+        num_floats = len(data) // 4
+        floats = list(struct.unpack(f'<{num_floats}f', data[:num_floats * 4]))
+        if self.value_index >= len(floats):
+            self.report({'ERROR'}, f"Invalid index")
+            return {'CANCELLED'}
+
+        floats[self.value_index] = self.value
+        new_data = bytearray(struct.pack(f'<{num_floats}f', *floats))
+        if len(data) > num_floats * 4:
+            new_data.extend(data[num_floats * 4:])
+        setattr(mesh_file, self.field_name, new_data)
+
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Set {self.field_name}[{self.value_index}] = {self.value}")
+        return {'FINISHED'}
+
+
+class UnitMeshInfoUint32Operator(Operator):
+    """Edit a uint32 field in MeshInfo"""
+    bl_label = "Edit MeshInfo uint32"
+    bl_idname = "helldiver2.unit_meshinfo_uint32"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+    mesh_index: IntProperty()
+    field_name: StringProperty()
+    value: IntProperty(min=0, max=4294967295)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=300)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "value", text=self.field_name)
+        layout.label(text=f"Hex: 0x{self.value:08x}")
+
+    def execute(self, context):
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None or not Entry.IsLoaded:
+            self.report({'ERROR'}, f"Could not find entry")
+            return {'CANCELLED'}
+
+        mesh_file = Entry.LoadedData
+        if self.mesh_index >= len(mesh_file.MeshInfoArray):
+            self.report({'ERROR'}, f"Invalid mesh index")
+            return {'CANCELLED'}
+
+        mesh_info = mesh_file.MeshInfoArray[self.mesh_index]
+        setattr(mesh_info, self.field_name, self.value)
+
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Set Mesh[{self.mesh_index}].{self.field_name} = {self.value}")
+        return {'FINISHED'}
+
+
+class UnitMeshInfoInt32Operator(Operator):
+    """Edit an int32 field in MeshInfo"""
+    bl_label = "Edit MeshInfo int32"
+    bl_idname = "helldiver2.unit_meshinfo_int32"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+    mesh_index: IntProperty()
+    field_name: StringProperty()
+    value: IntProperty(min=-2147483648, max=2147483647)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=250)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "value", text=self.field_name)
+
+    def execute(self, context):
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None or not Entry.IsLoaded:
+            self.report({'ERROR'}, f"Could not find entry")
+            return {'CANCELLED'}
+
+        mesh_file = Entry.LoadedData
+        if self.mesh_index >= len(mesh_file.MeshInfoArray):
+            self.report({'ERROR'}, f"Invalid mesh index")
+            return {'CANCELLED'}
+
+        mesh_info = mesh_file.MeshInfoArray[self.mesh_index]
+        setattr(mesh_info, self.field_name, self.value)
+
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Set Mesh[{self.mesh_index}].{self.field_name} = {self.value}")
+        return {'FINISHED'}
+
+
+class UnitMeshInfoUint64Operator(Operator):
+    """Edit a uint64 field in MeshInfo"""
+    bl_label = "Edit MeshInfo uint64"
+    bl_idname = "helldiver2.unit_meshinfo_uint64"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+    mesh_index: IntProperty()
+    field_name: StringProperty()
+    value: IntProperty()  # Note: Blender IntProperty is limited, we use string for display
+    value_str: StringProperty()
+
+    def invoke(self, context, event):
+        self.value_str = str(self.value)
+        return context.window_manager.invoke_props_dialog(self, width=350)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "value_str", text=self.field_name)
+        try:
+            val = int(self.value_str)
+            layout.label(text=f"Hex: 0x{val:016x}")
+        except:
+            layout.label(text="Invalid number", icon='ERROR')
+
+    def execute(self, context):
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        try:
+            new_value = int(self.value_str)
+        except:
+            self.report({'ERROR'}, "Invalid number")
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None or not Entry.IsLoaded:
+            self.report({'ERROR'}, f"Could not find entry")
+            return {'CANCELLED'}
+
+        mesh_file = Entry.LoadedData
+        if self.mesh_index >= len(mesh_file.MeshInfoArray):
+            self.report({'ERROR'}, f"Invalid mesh index")
+            return {'CANCELLED'}
+
+        mesh_info = mesh_file.MeshInfoArray[self.mesh_index]
+        setattr(mesh_info, self.field_name, new_value)
+
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Set Mesh[{self.mesh_index}].{self.field_name} = {new_value}")
+        return {'FINISHED'}
+
+
+class UnitMeshInfoUnk6Operator(Operator):
+    """Edit unk6 (40 bytes) in MeshInfo"""
+    bl_label = "Edit MeshInfo unk6"
+    bl_idname = "helldiver2.unit_meshinfo_unk6"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+    mesh_index: IntProperty()
+
+    # 10 float values
+    f0: FloatProperty(name="[0]")
+    f1: FloatProperty(name="[1]")
+    f2: FloatProperty(name="[2]")
+    f3: FloatProperty(name="[3]")
+    f4: FloatProperty(name="[4]")
+    f5: FloatProperty(name="[5]")
+    f6: FloatProperty(name="[6]")
+    f7: FloatProperty(name="[7]")
+    f8: FloatProperty(name="[8]")
+    f9: FloatProperty(name="[9]")
+
+    def invoke(self, context, event):
+        import struct
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry and Entry.IsLoaded:
+            mesh_file = Entry.LoadedData
+            if self.mesh_index < len(mesh_file.MeshInfoArray):
+                mesh_info = mesh_file.MeshInfoArray[self.mesh_index]
+                if len(mesh_info.unk6) == 40:
+                    floats = struct.unpack('<10f', mesh_info.unk6)
+                    self.f0, self.f1, self.f2, self.f3, self.f4 = floats[0], floats[1], floats[2], floats[3], floats[4]
+                    self.f5, self.f6, self.f7, self.f8, self.f9 = floats[5], floats[6], floats[7], floats[8], floats[9]
+
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="unk6 (40 bytes = 10 floats)", icon='FILE_HIDDEN')
+        row = layout.row()
+        row.prop(self, "f0")
+        row.prop(self, "f1")
+        row = layout.row()
+        row.prop(self, "f2")
+        row.prop(self, "f3")
+        row = layout.row()
+        row.prop(self, "f4")
+        row.prop(self, "f5")
+        row = layout.row()
+        row.prop(self, "f6")
+        row.prop(self, "f7")
+        row = layout.row()
+        row.prop(self, "f8")
+        row.prop(self, "f9")
+
+    def execute(self, context):
+        import struct
+
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None or not Entry.IsLoaded:
+            self.report({'ERROR'}, f"Could not find entry")
+            return {'CANCELLED'}
+
+        mesh_file = Entry.LoadedData
+        if self.mesh_index >= len(mesh_file.MeshInfoArray):
+            self.report({'ERROR'}, f"Invalid mesh index")
+            return {'CANCELLED'}
+
+        mesh_info = mesh_file.MeshInfoArray[self.mesh_index]
+        floats = [self.f0, self.f1, self.f2, self.f3, self.f4, self.f5, self.f6, self.f7, self.f8, self.f9]
+        mesh_info.unk6 = bytearray(struct.pack('<10f', *floats))
+
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Updated Mesh[{self.mesh_index}].unk6")
+        return {'FINISHED'}
+
+
+class MakeUnitAlwaysVisibleOperator(Operator):
+    """Make units always visible regardless of distance (supports multiple selection)"""
+    bl_label = "Make Always Visible"
+    bl_idname = "helldiver2.make_always_visible"
+    bl_description = "Set all LOD thresholds to 0 to make units always visible at any distance"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()  # Comma-separated list of IDs
+
+    expand_bbox: BoolProperty(
+        name="Also Expand Bounding Boxes",
+        description="Expand bounding boxes to reduce frustum culling (object stays visible when looking slightly away)",
+        default=False
+    )
+
+    bbox_scale: FloatProperty(
+        name="Bbox Scale",
+        description="How much to expand the bounding box (higher = more visible when off-screen)",
+        default=10.0,
+        min=1.0,
+        max=1000.0
+    )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=350)
+
+    def draw(self, context):
+        layout = self.layout
+        # Count how many units will be modified
+        ids = [id.strip() for id in self.object_id.split(',') if id.strip()]
+        count = len(ids)
+
+        if count > 1:
+            layout.label(text=f"This will modify {count} units", icon='HIDE_OFF')
+        else:
+            layout.label(text="This will set all LOD thresholds to 0.0", icon='HIDE_OFF')
+
+        layout.prop(self, "expand_bbox")
+        if self.expand_bbox:
+            layout.prop(self, "bbox_scale")
+        layout.separator()
+        layout.label(text="Changes will be saved to the patch.", icon='INFO')
+
+    def execute(self, context):
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        if not self.object_id:
+            self.report({'ERROR'}, "No object ID provided")
+            return {'CANCELLED'}
+
+        # Parse comma-separated IDs
+        ids = [id.strip() for id in self.object_id.split(',') if id.strip()]
+
+        if not ids:
+            self.report({'ERROR'}, "No valid IDs provided")
+            return {'CANCELLED'}
+
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        success_count = 0
+        error_count = 0
+
+        for object_id in ids:
+            try:
+                Entry = Global_TocManager.GetEntryByLoadArchive(int(object_id), UnitID)
+                if Entry is None:
+                    PrettyPrint(f"Could not find entry for ID: {object_id}", "WARNING")
+                    error_count += 1
+                    continue
+
+                if not Entry.IsLoaded:
+                    Entry.Load(True, False, True)
+
+                if not Entry.LoadedData:
+                    error_count += 1
+                    continue
+
+                mesh_file = Entry.LoadedData
+
+                # Modify LOD thresholds
+                mesh_file.UnreversedLODGroupListData = modify_lod_data_for_always_visible(
+                    mesh_file.UnreversedLODGroupListData, mode='zero'
+                )
+
+                # Expand bounding boxes if requested
+                if self.expand_bbox:
+                    for mesh_info in mesh_file.MeshInfoArray:
+                        if len(mesh_info.unk2) == 32:
+                            mesh_info.unk2 = expand_bounding_box(mesh_info.unk2, self.bbox_scale)
+
+                # Add to patch and save
+                Entry = Global_TocManager.AddEntryToPatchID(Entry, int(object_id))
+                wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+                if wasSaved:
+                    success_count += 1
+                    PrettyPrint(f"Made always visible: {object_id}")
+                else:
+                    error_count += 1
+
+            except Exception as e:
+                PrettyPrint(f"Error processing {object_id}: {str(e)}", "ERROR")
+                error_count += 1
+
+        if success_count > 0:
+            msg = f"Made {success_count} unit(s) always visible"
+            if error_count > 0:
+                msg += f" ({error_count} errors)"
+            self.report({'INFO'}, msg)
+            return {'FINISHED'}
+        else:
+            self.report({'ERROR'}, f"Failed to modify any units ({error_count} errors)")
+            return {'CANCELLED'}
+
+
+class SaveUnitDataOperator(Operator):
+    """Save the current unit data to patch"""
+    bl_label = "Save Unit Data"
+    bl_idname = "helldiver2.save_unit_data"
+    bl_description = "Save the unit's current LOD and visibility settings to the patch"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty()
+
+    def execute(self, context):
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        Entry = Global_TocManager.GetEntryByLoadArchive(int(self.object_id), UnitID)
+        if Entry is None:
+            self.report({'ERROR'}, f"Could not find entry for ID: {self.object_id}")
+            return {'CANCELLED'}
+
+        if not Entry.IsLoaded:
+            Entry.Load(True, False, True)
+
+        # Add to patch and save
+        Entry = Global_TocManager.AddEntryToPatchID(Entry, int(self.object_id))
+        BlenderOpts = context.scene.Hd2ToolPanelSettings.get_settings_dict()
+        wasSaved = Entry.Save(BlenderOpts=BlenderOpts)
+
+        if not wasSaved:
+            self.report({'ERROR'}, "Failed to save unit")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Saved unit data for ID: {self.object_id}")
+        return {'FINISHED'}
+
+
+class AuditUnitLodValuesOperator(Operator, ExportHelper):
+    """Audit all loaded units and sort by LOD/visibility values, output to file"""
+    bl_label = "Audit Unit LOD Values"
+    bl_idname = "helldiver2.audit_unit_lod"
+    bl_description = "Scan all archives for units and output sorted by LOD thresholds to a text file"
+    bl_options = {'REGISTER'}
+
+    filename_ext = ".txt"
+    filter_glob: StringProperty(default="*.txt", options={'HIDDEN'})
+
+    scan_all_archives: BoolProperty(
+        name="Scan All Archives",
+        description="Scan all archives in game folder (slow but thorough). Requires loading one archive first to populate index.",
+        default=True
+    )
+
+    sort_by: EnumProperty(
+        name="Sort By",
+        items=[
+            ('lod_min', "Min LOD Threshold", "Sort by smallest LOD threshold value"),
+            ('lod_max', "Max LOD Threshold", "Sort by largest LOD threshold value"),
+            ('lod_count', "LOD Value Count", "Sort by number of LOD values"),
+            ('bbox_size', "Bounding Box Size", "Sort by bounding box volume"),
+            ('unk1', "MeshInfo.unk1", "Sort by unk1 value"),
+            ('unk3', "MeshInfo.unk3", "Sort by unk3 value"),
+            ('unk8', "MeshInfo.unk8", "Sort by unk8 value"),
+        ],
+        default='lod_min'
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "scan_all_archives")
+        layout.prop(self, "sort_by")
+
+    def execute(self, context):
+        import struct
+        import gc
+        from datetime import datetime
+        from pathlib import Path
+
+        # Determine which archives to scan
+        archives_to_scan = []
+        if self.scan_all_archives:
+            if len(Global_TocManager.SearchArchives) > 0:
+                archives_to_scan = Global_TocManager.SearchArchives
+            else:
+                self.report({'ERROR'}, "No search archives available. Load at least one archive first to populate the search index.")
+                return {'CANCELLED'}
+        else:
+            if len(Global_TocManager.LoadedArchives) == 0:
+                self.report({'ERROR'}, "No archives loaded")
+                return {'CANCELLED'}
+            archives_to_scan = Global_TocManager.LoadedArchives
+
+        results = []
+        errors = 0
+        processed_ids = set()  # Avoid duplicates across archives
+
+        total_archives = len(archives_to_scan)
+        BATCH_SIZE = 50  # Process archives in batches to avoid memory explosion
+
+        PrettyPrint(f"UNIT LOD AUDIT - Scanning {total_archives} archives in batches of {BATCH_SIZE}...")
+
+        for batch_start in range(0, total_archives, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_archives)
+            batch_archives = archives_to_scan[batch_start:batch_end]
+
+            PrettyPrint(f"=== Batch {batch_start//BATCH_SIZE + 1}: Archives {batch_start+1}-{batch_end} of {total_archives} ===")
+
+            for archive in batch_archives:
+                # Get archive name from path
+                archive_name = Path(archive.Path).stem if hasattr(archive, 'Path') else "unknown"
+
+                # Get unit file IDs from this archive
+                unit_file_ids = []
+                loaded_archive = None
+
+                if hasattr(archive, 'TocDict'):
+                    # Already a full archive with entries (StreamToc)
+                    loaded_archive = archive
+                    unit_file_ids = list(archive.TocDict.get(UnitID, {}).keys())
+                elif hasattr(archive, 'TocEntries'):
+                    # SearchToc - need to load the archive
+                    unit_file_ids = archive.TocEntries.get(UnitID, [])
+                    if len(unit_file_ids) > 0:
+                        try:
+                            loaded_archive = Global_TocManager.LoadArchive(archive.Path, SetActive=False)
+                        except Exception as e:
+                            PrettyPrint(f"  Skipping archive {archive_name} - load error: {e}", 'WARN')
+                            errors += 1
+                            continue
+
+                if len(unit_file_ids) == 0 or loaded_archive is None:
+                    continue
+
+                for file_id in unit_file_ids:
+                    # Skip if already processed from another archive
+                    if file_id in processed_ids:
+                        continue
+                    processed_ids.add(file_id)
+
+                    try:
+                        entry = loaded_archive.GetEntry(file_id, UnitID)
+                        if entry is None:
+                            continue
+
+                        # Load if needed
+                        if not entry.IsLoaded:
+                            entry.Load(False, False, True)
+
+                        if not entry.LoadedData:
+                            continue
+
+                        mesh_file = entry.LoadedData
+
+                        # Extract LOD data
+                        lod_data = mesh_file.UnreversedLODGroupListData
+                        lod_floats = []
+                        if lod_data and len(lod_data) >= 4:
+                            num_floats = len(lod_data) // 4
+                            lod_floats = list(struct.unpack(f'<{num_floats}f', lod_data[:num_floats * 4]))
+                            lod_floats = [f for f in lod_floats if -1e6 < f < 1e6]
+
+                        # Extract MeshInfo values (from first mesh)
+                        unk1 = unk3 = unk4 = unk8 = 0
+                        bbox_size = 0
+                        bbox_str = ""
+                        unk6_str = ""
+                        if mesh_file.MeshInfoArray:
+                            mi = mesh_file.MeshInfoArray[0]
+                            unk1 = mi.unk1
+                            unk3 = mi.unk3
+                            unk4 = mi.unk4
+                            unk8 = mi.unk8
+                            if len(mi.unk2) == 32:
+                                bbox = struct.unpack('<8f', mi.unk2)
+                                dx = abs(bbox[4] - bbox[0])
+                                dy = abs(bbox[5] - bbox[1])
+                                dz = abs(bbox[6] - bbox[2])
+                                bbox_size = dx * dy * dz
+                                bbox_str = f"({bbox[0]:.2f},{bbox[1]:.2f},{bbox[2]:.2f})->({bbox[4]:.2f},{bbox[5]:.2f},{bbox[6]:.2f})"
+                            if len(mi.unk6) == 40:
+                                unk6 = struct.unpack('<10f', mi.unk6)
+                                unk6_str = ",".join([f"{v:.2f}" for v in unk6])
+
+                        # Calculate sort key
+                        if self.sort_by == 'lod_min':
+                            sort_key = min(lod_floats) if lod_floats else float('inf')
+                        elif self.sort_by == 'lod_max':
+                            sort_key = max(lod_floats) if lod_floats else 0
+                        elif self.sort_by == 'lod_count':
+                            sort_key = len(lod_floats)
+                        elif self.sort_by == 'bbox_size':
+                            sort_key = bbox_size
+                        elif self.sort_by == 'unk1':
+                            sort_key = unk1
+                        elif self.sort_by == 'unk3':
+                            sort_key = unk3
+                        elif self.sort_by == 'unk8':
+                            sort_key = unk8
+                        else:
+                            sort_key = 0
+
+                        results.append({
+                            'file_id': file_id,
+                            'archive': archive_name,
+                            'sort_key': sort_key,
+                            'lod_floats': lod_floats,
+                            'lod_min': min(lod_floats) if lod_floats else None,
+                            'lod_max': max(lod_floats) if lod_floats else None,
+                            'lod_count': len(lod_floats),
+                            'lod_all': ",".join([f"{v:.6f}" for v in lod_floats]),
+                            'bbox_size': bbox_size,
+                            'bbox_str': bbox_str,
+                            'unk1': unk1,
+                            'unk3': unk3,
+                            'unk4': unk4,
+                            'unk6_str': unk6_str,
+                            'unk8': unk8,
+                            'mesh_count': len(mesh_file.MeshInfoArray),
+                        })
+
+                    except Exception as e:
+                        errors += 1
+
+            # Free memory after each batch - unload archives loaded during this batch
+            Global_TocManager.LoadedArchives = []
+            Global_TocManager.ActiveArchive = None
+            gc.collect()
+            PrettyPrint(f"  Batch complete. Units found so far: {len(results)}")
+
+        # Sort results
+        reverse = self.sort_by in ['lod_max', 'lod_count', 'bbox_size', 'unk1', 'unk3', 'unk8']
+        results.sort(key=lambda x: x['sort_key'], reverse=reverse)
+
+        # Write to file
+        with open(self.filepath, 'w', encoding='utf-8') as f:
+            f.write(f"HD2SDK Unit LOD Audit Report\n")
+            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"Total Units: {len(results)} ({errors} errors)\n")
+            f.write(f"Sorted by: {self.sort_by} ({'descending' if reverse else 'ascending'})\n")
+            f.write("=" * 150 + "\n\n")
+
+            # Header
+            f.write(f"{'Archive':<45} {'UnitID':<22} {'LOD Min':>12} {'LOD Max':>12} {'#LOD':>5} {'BBox Vol':>14} {'unk1':>12} {'unk3':>12} {'unk4':>12}\n")
+            f.write("-" * 150 + "\n")
+
+            # All results
+            for r in results:
+                archive_short = r['archive'][-43:] if len(r['archive']) > 43 else r['archive']
+                lod_min = f"{r['lod_min']:.6f}" if r['lod_min'] is not None else "N/A"
+                lod_max = f"{r['lod_max']:.6f}" if r['lod_max'] is not None else "N/A"
+                f.write(f"{archive_short:<45} {r['file_id']:<22} {lod_min:>12} {lod_max:>12} {r['lod_count']:>5} {r['bbox_size']:>14.1f} {r['unk1']:>12} {r['unk3']:>12} {r['unk4']:>12}\n")
+
+            # Detailed section
+            f.write("\n\n" + "=" * 150 + "\n")
+            f.write("DETAILED DATA (All LOD values, bbox, unk6)\n")
+            f.write("=" * 150 + "\n\n")
+
+            for r in results:
+                f.write(f"Archive: {r['archive']}\n")
+                f.write(f"UnitID: {r['file_id']} (0x{r['file_id']:016x})\n")
+                f.write(f"  LOD values: [{r['lod_all']}]\n")
+                f.write(f"  Bbox: {r['bbox_str']}\n")
+                f.write(f"  unk1: {r['unk1']} (0x{r['unk1']:016x})\n")
+                f.write(f"  unk3: {r['unk3']} (0x{r['unk3']:08x})\n")
+                f.write(f"  unk4: {r['unk4']} (0x{r['unk4']:08x})\n")
+                f.write(f"  unk6: [{r['unk6_str']}]\n")
+                f.write(f"  unk8: {r['unk8']} (0x{r['unk8']:016x})\n")
+                f.write("\n")
+
+            # Notable entries
+            f.write("\n" + "=" * 150 + "\n")
+            f.write("NOTABLE ENTRIES\n")
+            f.write("=" * 150 + "\n\n")
+
+            always_visible = [r for r in results if r['lod_min'] == 0.0]
+            f.write(f"Units with LOD min = 0.0 (potentially always visible): {len(always_visible)}\n")
+            for r in always_visible:
+                f.write(f"  {r['archive']}_{r['file_id']}\n")
+
+            f.write("\n")
+            small_lod = [r for r in results if r['lod_min'] is not None and 0 < r['lod_min'] < 0.01]
+            f.write(f"Units with very small LOD min (< 0.01): {len(small_lod)}\n")
+            for r in small_lod:
+                f.write(f"  {r['archive']}_{r['file_id']} - LOD min: {r['lod_min']:.6f}\n")
+
+        self.report({'INFO'}, f"Audit complete. {len(results)} units written to {self.filepath}")
+        return {'FINISHED'}
+
 
 class BatchSaveStingrayUnitOperator(Operator):
     bl_label  = "Save Units"
@@ -2872,6 +6109,231 @@ class BatchSaveStingrayUnitOperator(Operator):
             self.report({'ERROR'}, f"Errors occurred while saving units. Click here to view.")
         PrettyPrint(f"Time to save units: {time.time()-start}")
         return{'FINISHED'}
+
+class OverrideAllHelmetsOperator(Operator):
+    bl_label = "Override All Helmets"
+    bl_idname = "helldiver2.override_all_helmets"
+    bl_description = "Replace all helmet meshes with the selected patched unit"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    object_id: StringProperty(name="Object ID", default="")
+
+    _timer = None
+    _helmet_list = None
+    _helmet_index = 0
+    _success_count = 0
+    _error_count = 0
+    _source_toc_data = None
+    _source_gpu_data = None
+    _source_stream_data = None
+    _source_materials = None  # Dict of {MaterialID: (TocData, GpuData, StreamData)}
+    _source_textures = None   # Dict of {TexID: (TocData, GpuData, StreamData)}
+    _start_time = 0
+
+    def modal(self, context, event):
+        if event.type == 'TIMER':
+            # Process one helmet per timer tick
+            if self._helmet_index >= len(self._helmet_list):
+                # Done processing all helmets
+                self.finish(context)
+                elapsed = time.time() - self._start_time
+                self.report({'INFO'}, f"Overridden {self._success_count}/{len(self._helmet_list)} helmets in {elapsed:.2f}s. Errors: {self._error_count}")
+                return {'FINISHED'}
+
+            hex_id, helmet_name = self._helmet_list[self._helmet_index]
+            self._helmet_index += 1
+
+            # Update status
+            context.workspace.status_text_set(f"Processing helmet {self._helmet_index}/{len(self._helmet_list)}: {helmet_name}")
+
+            try:
+                # Load the archive to get the actual unit FileIDs inside
+                archive_path = Global_gamepath + hex_id
+                loaded_archive = Global_TocManager.LoadArchive(archive_path)
+
+                if loaded_archive is None:
+                    PrettyPrint(f"Could not load archive for helmet: {helmet_name}")
+                    self._error_count += 1
+                    return {'RUNNING_MODAL'}
+
+                # Get the actual unit FileIDs from this archive
+                unit_entries = loaded_archive.TocDict.get(UnitID, {})
+                if len(unit_entries) == 0:
+                    PrettyPrint(f"No unit entries in helmet archive: {helmet_name}")
+                    self._error_count += 1
+                    return {'RUNNING_MODAL'}
+
+                # For each unit in this helmet archive, create a patch entry with copied binary data
+                for unit_file_id in unit_entries.keys():
+                    # Create new entry with same binary data but different FileID
+                    patch_entry = TocEntry()
+                    patch_entry.FileID = unit_file_id
+                    patch_entry.TypeID = UnitID
+                    patch_entry.IsModified = True
+                    patch_entry.TocData = bytes(self._source_toc_data)
+                    patch_entry.GpuData = bytes(self._source_gpu_data)
+                    patch_entry.StreamData = bytes(self._source_stream_data)
+                    patch_entry.TocData_Size = len(patch_entry.TocData)
+                    patch_entry.GpuData_Size = len(patch_entry.GpuData)
+                    patch_entry.StreamData_Size = len(patch_entry.StreamData)
+
+                    # Add to patch
+                    Global_TocManager.ActivePatch.AddEntry(patch_entry, override=True)
+
+                # Also add all materials from the source mesh
+                for mat_id, (toc_data, gpu_data, stream_data) in self._source_materials.items():
+                    mat_entry = TocEntry()
+                    mat_entry.FileID = mat_id
+                    mat_entry.TypeID = MaterialID
+                    mat_entry.IsModified = True
+                    mat_entry.TocData = bytes(toc_data)
+                    mat_entry.GpuData = bytes(gpu_data)
+                    mat_entry.StreamData = bytes(stream_data)
+                    mat_entry.TocData_Size = len(mat_entry.TocData)
+                    mat_entry.GpuData_Size = len(mat_entry.GpuData)
+                    mat_entry.StreamData_Size = len(mat_entry.StreamData)
+                    Global_TocManager.ActivePatch.AddEntry(mat_entry, override=True)
+
+                # Also add all textures from the source materials
+                for tex_id, (toc_data, gpu_data, stream_data) in self._source_textures.items():
+                    tex_entry = TocEntry()
+                    tex_entry.FileID = tex_id
+                    tex_entry.TypeID = TexID
+                    tex_entry.IsModified = True
+                    tex_entry.TocData = bytes(toc_data)
+                    tex_entry.GpuData = bytes(gpu_data)
+                    tex_entry.StreamData = bytes(stream_data)
+                    tex_entry.TocData_Size = len(tex_entry.TocData)
+                    tex_entry.GpuData_Size = len(tex_entry.GpuData)
+                    tex_entry.StreamData_Size = len(tex_entry.StreamData)
+                    Global_TocManager.ActivePatch.AddEntry(tex_entry, override=True)
+
+                self._success_count += 1
+
+            except Exception as e:
+                PrettyPrint(f"Error processing helmet {helmet_name}: {str(e)}")
+                self._error_count += 1
+
+            return {'RUNNING_MODAL'}
+
+        elif event.type == 'ESC':
+            self.finish(context)
+            self.report({'WARNING'}, f"Cancelled. Processed {self._success_count} helmets before cancellation.")
+            return {'CANCELLED'}
+
+        return {'PASS_THROUGH'}
+
+    def finish(self, context):
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        context.workspace.status_text_set(None)
+
+    def invoke(self, context, event):
+        self._start_time = time.time()
+
+        # Validate patches are loaded
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        # Get the entry by object_id
+        if not self.object_id:
+            self.report({'ERROR'}, "No unit specified")
+            return {'CANCELLED'}
+
+        try:
+            file_id = int(self.object_id)
+        except ValueError:
+            self.report({'ERROR'}, f"Invalid object ID: {self.object_id}")
+            return {'CANCELLED'}
+
+        # Get the patch version of the entry which has the binary data
+        patch_source = Global_TocManager.ActivePatch.GetEntry(file_id, UnitID)
+        if patch_source is None:
+            self.report({'ERROR'}, "Unit must be in the patch. Save the mesh first.")
+            return {'CANCELLED'}
+
+        # Ensure binary data exists
+        if patch_source.TocData is None or len(patch_source.TocData) == 0:
+            self.report({'ERROR'}, "Source entry has no binary data. Save the mesh first.")
+            return {'CANCELLED'}
+
+        # Store the binary data from the source entry
+        self._source_toc_data = bytes(patch_source.TocData)
+        self._source_gpu_data = bytes(patch_source.GpuData) if patch_source.GpuData else b""
+        self._source_stream_data = bytes(patch_source.StreamData) if patch_source.StreamData else b""
+
+        PrettyPrint(f"Source entry binary sizes - Toc: {len(self._source_toc_data)}, Gpu: {len(self._source_gpu_data)}, Stream: {len(self._source_stream_data)}")
+
+        # Load and parse the source mesh to get MaterialIDs
+        self._source_materials = {}
+        self._source_textures = {}
+
+        try:
+            # Parse the mesh to extract MaterialIDs
+            if not patch_source.IsLoaded:
+                patch_source.Load(False, False, True)  # Load without creating Blender objects
+
+            if patch_source.LoadedData and hasattr(patch_source.LoadedData, 'MaterialIDs'):
+                material_ids = patch_source.LoadedData.MaterialIDs
+                PrettyPrint(f"Found {len(material_ids)} materials in source mesh: {material_ids}")
+
+                for mat_id in material_ids:
+                    # Get material entry from patch or archive
+                    mat_entry = Global_TocManager.GetEntry(mat_id, MaterialID, SearchAll=True)
+                    if mat_entry and mat_entry.TocData:
+                        self._source_materials[mat_id] = (
+                            bytes(mat_entry.TocData),
+                            bytes(mat_entry.GpuData) if mat_entry.GpuData else b"",
+                            bytes(mat_entry.StreamData) if mat_entry.StreamData else b""
+                        )
+                        PrettyPrint(f"Collected material {mat_id}")
+
+                        # Load material to get texture IDs
+                        if not mat_entry.IsLoaded:
+                            mat_entry.Load(False, False)
+
+                        if mat_entry.LoadedData and hasattr(mat_entry.LoadedData, 'TexIDs'):
+                            for tex_id in mat_entry.LoadedData.TexIDs:
+                                if tex_id not in self._source_textures:
+                                    tex_entry = Global_TocManager.GetEntry(tex_id, TexID, SearchAll=True)
+                                    if tex_entry and tex_entry.TocData:
+                                        self._source_textures[tex_id] = (
+                                            bytes(tex_entry.TocData),
+                                            bytes(tex_entry.GpuData) if tex_entry.GpuData else b"",
+                                            bytes(tex_entry.StreamData) if tex_entry.StreamData else b""
+                                        )
+                                        PrettyPrint(f"Collected texture {tex_id}")
+
+                PrettyPrint(f"Total collected: {len(self._source_materials)} materials, {len(self._source_textures)} textures")
+        except Exception as e:
+            PrettyPrint(f"Warning: Could not collect materials/textures: {str(e)}")
+
+        # Load helmet IDs from archivehashes.json
+        try:
+            with open(Global_archivehashpath, "r") as f:
+                archive_data = json.load(f)
+            helmet_ids = archive_data.get("Helmet", {})
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to load archivehashes.json: {str(e)}")
+            return {'CANCELLED'}
+
+        if len(helmet_ids) == 0:
+            self.report({'ERROR'}, "No helmets found in archivehashes.json")
+            return {'CANCELLED'}
+
+        # Store state for modal
+        self._helmet_list = list(helmet_ids.items())
+        self._helmet_index = 0
+        self._success_count = 0
+        self._error_count = 0
+
+        # Start timer for modal processing
+        self._timer = context.window_manager.event_timer_add(0.01, window=context.window)
+        context.window_manager.modal_handler_add(self)
+
+        self.report({'INFO'}, f"Starting to process {len(self._helmet_list)} helmets with {len(self._source_materials)} materials and {len(self._source_textures)} textures...")
+        return {'RUNNING_MODAL'}
 
 def SaveMeshMaterials(objects):
     if not bpy.context.scene.Hd2ToolPanelSettings.AutoSaveUnitMaterials:
@@ -3010,7 +6472,7 @@ class ExportTexturePNGOperator(Operator, ExportHelper):
         Global_TocManager.Load(int(self.object_id), TexID)
         Entry = Global_TocManager.GetEntry(int(self.object_id), TexID)
         if Entry != None:
-            tempdir = tempfile.gettempdir()
+            tempdir = get_temp_folder()
             for i in range(Entry.LoadedData.ArraySize):
                 filename = os.path.basename(self.filepath)
                 directory = self.filepath.replace(filename, "")
@@ -3078,7 +6540,7 @@ class BatchExportTexturePNGOperator(Operator):
             Global_TocManager.Load(EntryID, TexID)
             Entry = Global_TocManager.GetEntry(EntryID, TexID)
             if Entry != None:
-                tempdir = tempfile.gettempdir()
+                tempdir = get_temp_folder()
                 dds_path = f"{tempdir}/{EntryID}.dds"
                 with open(dds_path, 'w+b') as f:
                     f.write(Entry.LoadedData.ToDDS())
@@ -3094,7 +6556,1887 @@ class BatchExportTexturePNGOperator(Operator):
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
-    
+
+# Helper function to check if a texture is likely a UI atlas using raw file analysis (no Blender)
+def is_ui_atlas_texture_fast(png_path, black_threshold=0.6, max_unique_colors=50):
+    """
+    Fast PNG analysis without Blender's image loading.
+    Reads PNG directly and samples pixels for speed.
+    """
+    try:
+        import struct
+        import zlib
+
+        with open(png_path, 'rb') as f:
+            # Verify PNG signature
+            sig = f.read(8)
+            if sig != b'\x89PNG\r\n\x1a\n':
+                return False, 0, 0
+
+            width = height = 0
+            idat_data = b''
+
+            # Read chunks
+            while True:
+                chunk_len = struct.unpack('>I', f.read(4))[0]
+                chunk_type = f.read(4)
+
+                if chunk_type == b'IHDR':
+                    data = f.read(chunk_len)
+                    width, height = struct.unpack('>II', data[:8])
+                    f.read(4)  # CRC
+                elif chunk_type == b'IDAT':
+                    idat_data += f.read(chunk_len)
+                    f.read(4)  # CRC
+                elif chunk_type == b'IEND':
+                    break
+                else:
+                    f.read(chunk_len + 4)
+
+            # Decompress image data
+            raw_data = zlib.decompress(idat_data)
+
+            # Sample pixels (stride = width * 4 + 1 for filter byte)
+            stride = width * 4 + 1
+            black_count = 0
+            unique_colors = set()
+            sample_step = max(1, (width * height) // 5000)  # Sample ~5000 pixels
+            sampled = 0
+
+            for y in range(0, height, max(1, int(sample_step ** 0.5))):
+                row_start = y * stride + 1  # Skip filter byte
+                for x in range(0, width, max(1, int(sample_step ** 0.5))):
+                    idx = row_start + x * 4
+                    if idx + 3 >= len(raw_data):
+                        continue
+                    r, g, b, a = raw_data[idx], raw_data[idx+1], raw_data[idx+2], raw_data[idx+3]
+                    sampled += 1
+
+                    # Check black or transparent
+                    if a < 25 or (r < 13 and g < 13 and b < 13):
+                        black_count += 1
+
+                    # Quantize colors
+                    color_key = (r // 25, g // 25, b // 25)
+                    unique_colors.add(color_key)
+
+            if sampled == 0:
+                return False, 0, 0
+
+            black_ratio = black_count / sampled
+            num_colors = len(unique_colors)
+
+            return black_ratio >= black_threshold and num_colors <= max_unique_colors, black_ratio, num_colors
+
+    except Exception as e:
+        # Fallback to slower Blender method
+        return is_ui_atlas_texture_blender(png_path, black_threshold, max_unique_colors)
+
+def is_ui_atlas_texture_blender(png_path, black_threshold=0.6, max_unique_colors=50):
+    """Fallback Blender-based analysis."""
+    try:
+        img = bpy.data.images.load(png_path)
+        pixels = img.pixels[:]  # Faster than list()
+        total_pixels = img.size[0] * img.size[1]
+
+        black_count = 0
+        unique_colors = set()
+        sample_step = max(4, (total_pixels // 2500) * 4)
+
+        for i in range(0, len(pixels), sample_step):
+            if i + 3 >= len(pixels):
+                break
+            r, g, b, a = pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]
+
+            if a < 0.1 or (r < 0.05 and g < 0.05 and b < 0.05):
+                black_count += 1
+
+            color_key = (int(r * 10), int(g * 10), int(b * 10))
+            unique_colors.add(color_key)
+
+        bpy.data.images.remove(img)
+
+        sampled = len(pixels) // sample_step
+        black_ratio = black_count / sampled if sampled > 0 else 0
+        return black_ratio >= black_threshold and len(unique_colors) <= max_unique_colors, black_ratio, len(unique_colors)
+
+    except Exception as e:
+        return False, 0, 0
+
+# Helper function for template matching - extract color signature once, reuse for all textures
+def extract_template_colors(template_path):
+    """Extract color signature from template image (call once, reuse for all comparisons)."""
+    try:
+        img = bpy.data.images.load(template_path)
+        pixels = img.pixels[:]
+
+        template_colors = {}
+        sample_step = max(4, len(pixels) // 10000)
+
+        for i in range(0, len(pixels), sample_step):
+            if i + 3 >= len(pixels):
+                break
+            r, g, b, a = pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]
+
+            if a < 0.1 or (r < 0.1 and g < 0.1 and b < 0.1):
+                continue
+
+            color_key = (round(r, 1), round(g, 1), round(b, 1))
+            template_colors[color_key] = template_colors.get(color_key, 0) + 1
+
+        bpy.data.images.remove(img)
+        return template_colors
+
+    except Exception as e:
+        PrettyPrint(f"Error extracting template colors: {str(e)}", "warn")
+        return {}
+
+def match_texture_to_template(texture_path, template_colors, threshold=0.8):
+    """Fast color matching using pre-extracted template colors."""
+    try:
+        img = bpy.data.images.load(texture_path)
+        pixels = img.pixels[:]
+
+        texture_colors = {}
+        sample_step = max(4, len(pixels) // 10000)
+
+        for i in range(0, len(pixels), sample_step):
+            if i + 3 >= len(pixels):
+                break
+            r, g, b, a = pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]
+
+            if a < 0.1 or (r < 0.1 and g < 0.1 and b < 0.1):
+                continue
+
+            color_key = (round(r, 1), round(g, 1), round(b, 1))
+            texture_colors[color_key] = texture_colors.get(color_key, 0) + 1
+
+        bpy.data.images.remove(img)
+
+        if not template_colors:
+            return False, 0
+
+        matched = sum(1 for c in template_colors if c in texture_colors)
+        match_score = matched / len(template_colors)
+
+        return match_score >= threshold, match_score
+
+    except Exception as e:
+        return False, 0
+
+# Try to import OpenCV for better template matching
+try:
+    import cv2
+    import numpy as np
+    OPENCV_AVAILABLE = True
+except ImportError:
+    OPENCV_AVAILABLE = False
+    cv2 = None
+    np = None
+
+
+def compute_image_hash(image_path, hash_size=16):
+    """
+    Compute a perceptual hash (difference hash) for an image.
+    Returns a binary hash that can be compared with Hamming distance.
+    Works with or without OpenCV.
+    """
+    if OPENCV_AVAILABLE and cv2 is not None:
+        try:
+            img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return None
+
+            # Convert to grayscale
+            if len(img.shape) == 3:
+                if img.shape[2] == 4:
+                    # RGBA - use alpha as mask for transparent pixels
+                    gray = cv2.cvtColor(img[:,:,:3], cv2.COLOR_BGR2GRAY)
+                    alpha = img[:,:,3]
+                    # Set transparent pixels to a neutral value
+                    gray[alpha < 128] = 128
+                else:
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
+
+            # Resize to hash_size+1 x hash_size
+            resized = cv2.resize(gray, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+
+            # Compute difference hash (compare adjacent pixels)
+            diff = resized[:, 1:] > resized[:, :-1]
+
+            # Convert to integer hash
+            return diff.flatten()
+        except Exception as e:
+            PrettyPrint(f"Error computing image hash (OpenCV): {str(e)}", "warn")
+            return None
+    else:
+        # Fallback using Blender's image loading
+        try:
+            img = bpy.data.images.load(image_path)
+            pixels = img.pixels[:]
+            w, h = img.size[0], img.size[1]
+            bpy.data.images.remove(img)
+
+            # Sample pixels at grid positions
+            grid_vals = []
+            for gy in range(hash_size):
+                for gx in range(hash_size + 1):
+                    px = int(gx / (hash_size + 1) * w)
+                    py = int(gy / hash_size * h)
+                    px = min(px, w - 1)
+                    py = min(py, h - 1)
+                    idx = (py * w + px) * 4
+                    if idx + 3 < len(pixels):
+                        r, g, b, a = pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]
+                        # Grayscale value, neutral for transparent
+                        if a < 0.5:
+                            grid_vals.append(0.5)
+                        else:
+                            grid_vals.append(0.299 * r + 0.587 * g + 0.114 * b)
+                    else:
+                        grid_vals.append(0.5)
+
+            # Compute difference hash
+            diff = []
+            for gy in range(hash_size):
+                for gx in range(hash_size):
+                    idx = gy * (hash_size + 1) + gx
+                    diff.append(grid_vals[idx + 1] > grid_vals[idx])
+
+            return diff
+        except Exception as e:
+            PrettyPrint(f"Error computing image hash (Blender): {str(e)}", "warn")
+            return None
+
+
+def hash_similarity(hash1, hash2):
+    """
+    Compute similarity between two image hashes (0.0 to 1.0).
+    Uses Hamming distance - perfect match = 1.0
+    """
+    if hash1 is None or hash2 is None:
+        return 0.0
+
+    if len(hash1) != len(hash2):
+        return 0.0
+
+    # Count matching bits
+    if OPENCV_AVAILABLE and hasattr(hash1, 'flatten'):
+        matches = np.sum(hash1 == hash2)
+        total = len(hash1.flatten())
+    else:
+        matches = sum(1 for a, b in zip(hash1, hash2) if a == b)
+        total = len(hash1)
+
+    return matches / total if total > 0 else 0.0
+
+
+def compute_mse_similarity(image_path, template_path, target_size=64):
+    """
+    Compute structural similarity between two images using SSIM and contrast matching.
+    Returns similarity score 0.0 to 1.0 (1.0 = identical).
+
+    Uses multiple checks to filter false positives:
+    1. SSIM (Structural Similarity Index) - captures structural patterns
+    2. Contrast ratio - ensures both images have similar variance/texture density
+    3. Mean brightness difference - catches very different overall appearances
+
+    This is more robust than MSE alone for fog/noise textures where two "mostly white"
+    images can have high MSE similarity even though one has visible patterns and other is flat.
+    """
+    if not OPENCV_AVAILABLE or cv2 is None:
+        return 1.0  # If OpenCV unavailable, don't filter
+
+    try:
+        # Load both images
+        img1 = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        img2 = cv2.imread(template_path, cv2.IMREAD_UNCHANGED)
+
+        if img1 is None or img2 is None:
+            return 0.0
+
+        # Convert to grayscale for comparison
+        if len(img1.shape) == 3:
+            if img1.shape[2] == 4:
+                gray1 = cv2.cvtColor(img1[:,:,:3], cv2.COLOR_BGR2GRAY)
+            else:
+                gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+        else:
+            gray1 = img1
+
+        if len(img2.shape) == 3:
+            if img2.shape[2] == 4:
+                gray2 = cv2.cvtColor(img2[:,:,:3], cv2.COLOR_BGR2GRAY)
+            else:
+                gray2 = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+        else:
+            gray2 = img2
+
+        # Resize both to same size for comparison
+        resized1 = cv2.resize(gray1, (target_size, target_size), interpolation=cv2.INTER_AREA)
+        resized2 = cv2.resize(gray2, (target_size, target_size), interpolation=cv2.INTER_AREA)
+
+        # Convert to float for calculations
+        f1 = resized1.astype(np.float32)
+        f2 = resized2.astype(np.float32)
+
+        # 1. Compute SSIM (Structural Similarity Index)
+        # SSIM = (2*mu1*mu2 + C1) * (2*sigma12 + C2) / ((mu1^2 + mu2^2 + C1) * (sigma1^2 + sigma2^2 + C2))
+        C1 = (0.01 * 255) ** 2
+        C2 = (0.03 * 255) ** 2
+
+        mu1 = np.mean(f1)
+        mu2 = np.mean(f2)
+        sigma1_sq = np.var(f1)
+        sigma2_sq = np.var(f2)
+        sigma12 = np.mean((f1 - mu1) * (f2 - mu2))
+
+        ssim = ((2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1 ** 2 + mu2 ** 2 + C1) * (sigma1_sq + sigma2_sq + C2))
+
+        # 2. Check contrast ratio (standard deviation ratio)
+        # Both images should have similar "texture density"
+        std1 = np.sqrt(sigma1_sq)
+        std2 = np.sqrt(sigma2_sq)
+
+        # Avoid division by zero
+        if std2 < 1.0:
+            std2 = 1.0
+        if std1 < 1.0:
+            std1 = 1.0
+
+        contrast_ratio = min(std1, std2) / max(std1, std2)
+
+        # 3. Check mean brightness difference
+        mean_diff = abs(mu1 - mu2) / 255.0
+        brightness_sim = 1.0 - mean_diff
+
+        # Combine scores: require all three to be good
+        # SSIM is most important for structural matching
+        # Contrast ratio catches "flat vs textured" mismatches
+        # Brightness similarity catches overall appearance differences
+        combined = ssim * 0.5 + contrast_ratio * 0.3 + brightness_sim * 0.2
+
+        # Also apply a hard threshold: if contrast ratio is too low, reject
+        # This catches the case where template has texture but candidate is flat
+        if contrast_ratio < 0.3:
+            combined = combined * 0.5  # Penalize heavily
+
+        return max(0.0, min(1.0, combined))
+    except Exception as e:
+        return 0.0
+
+
+def compute_histogram_similarity(image_path, template_histogram):
+    """
+    Compare image histogram to template histogram.
+    Returns similarity score 0.0 to 1.0.
+    """
+    if not OPENCV_AVAILABLE or cv2 is None:
+        return 0.0
+
+    try:
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return 0.0
+
+        # Convert to BGR if RGBA
+        if len(img.shape) == 3 and img.shape[2] == 4:
+            # Use only non-transparent pixels
+            alpha = img[:,:,3]
+            mask = (alpha > 128).astype(np.uint8) * 255
+            bgr = img[:,:,:3]
+        else:
+            bgr = img if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            mask = None
+
+        # Compute histogram
+        hist = cv2.calcHist([bgr], [0, 1, 2], mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+
+        # Compare using correlation
+        similarity = cv2.compareHist(template_histogram, hist, cv2.HISTCMP_CORREL)
+        return max(0.0, similarity)  # Clamp to 0-1
+
+    except Exception as e:
+        return 0.0
+
+
+def compute_histogram(image_path):
+    """Compute color histogram for an image."""
+    if not OPENCV_AVAILABLE or cv2 is None:
+        return None
+
+    try:
+        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return None
+
+        if len(img.shape) == 3 and img.shape[2] == 4:
+            alpha = img[:,:,3]
+            mask = (alpha > 128).astype(np.uint8) * 255
+            bgr = img[:,:,:3]
+        else:
+            bgr = img if len(img.shape) == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            mask = None
+
+        hist = cv2.calcHist([bgr], [0, 1, 2], mask, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+        hist = cv2.normalize(hist, hist).flatten()
+        return hist
+
+    except Exception as e:
+        return None
+
+
+def find_template_contained(texture_path, template_path, threshold=0.7):
+    """
+    Check if template image is contained within texture.
+    Returns (found, score, location) where location is (x, y) of best match.
+    Uses multi-scale template matching to find the template at any size.
+    """
+    if not OPENCV_AVAILABLE or cv2 is None:
+        return False, 0.0, None
+
+    try:
+        texture = cv2.imread(texture_path, cv2.IMREAD_UNCHANGED)
+        template = cv2.imread(template_path, cv2.IMREAD_UNCHANGED)
+
+        if texture is None or template is None:
+            return False, 0.0, None
+
+        # Convert to grayscale, handling alpha
+        def to_gray_with_alpha(img):
+            if len(img.shape) == 3:
+                if img.shape[2] == 4:
+                    gray = cv2.cvtColor(img[:,:,:3], cv2.COLOR_BGR2GRAY)
+                    alpha = img[:,:,3]
+                    # Treat transparent as white (background)
+                    gray[alpha < 128] = 255
+                    return gray, alpha
+                else:
+                    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), None
+            return img, None
+
+        tex_gray, _ = to_gray_with_alpha(texture)
+        tpl_gray, tpl_alpha = to_gray_with_alpha(template)
+
+        # Create mask from alpha if available
+        tpl_mask = None
+        if tpl_alpha is not None:
+            tpl_mask = (tpl_alpha > 128).astype(np.uint8) * 255
+
+        best_score = 0.0
+        best_loc = None
+        best_scale = 1.0
+
+        # Try multiple scales
+        tex_h, tex_w = tex_gray.shape[:2]
+        tpl_h, tpl_w = tpl_gray.shape[:2]
+
+        # Calculate scale range based on size difference
+        min_scale = max(0.1, min(16 / tpl_w, 16 / tpl_h))  # Don't go smaller than 16px
+        max_scale = min(4.0, min(tex_w / tpl_w, tex_h / tpl_h) * 0.9)  # Don't exceed texture size
+
+        scales = [s for s in [0.125, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
+                  if min_scale <= s <= max_scale]
+
+        if not scales:
+            scales = [1.0]
+
+        for scale in scales:
+            new_w = int(tpl_w * scale)
+            new_h = int(tpl_h * scale)
+
+            if new_w < 8 or new_h < 8:
+                continue
+            if new_w > tex_w or new_h > tex_h:
+                continue
+
+            # Resize template
+            tpl_scaled = cv2.resize(tpl_gray, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            # Resize mask if available
+            mask_scaled = None
+            if tpl_mask is not None:
+                mask_scaled = cv2.resize(tpl_mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+            # Template matching
+            if mask_scaled is not None:
+                result = cv2.matchTemplate(tex_gray, tpl_scaled, cv2.TM_CCORR_NORMED, mask=mask_scaled)
+            else:
+                result = cv2.matchTemplate(tex_gray, tpl_scaled, cv2.TM_CCOEFF_NORMED)
+
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+            if max_val > best_score:
+                best_score = max_val
+                best_loc = max_loc
+                best_scale = scale
+
+                if best_score >= 0.95:
+                    break
+
+        return best_score >= threshold, best_score, best_loc
+
+    except Exception as e:
+        PrettyPrint(f"Error in contains matching: {str(e)}", "warn")
+        return False, 0.0, None
+
+
+def get_template_dimensions(template_path):
+    """Get dimensions of template image."""
+    if OPENCV_AVAILABLE and cv2 is not None:
+        try:
+            img = cv2.imread(template_path, cv2.IMREAD_UNCHANGED)
+            if img is not None:
+                return img.shape[1], img.shape[0]  # width, height
+        except:
+            pass
+
+    # Fallback to Blender
+    try:
+        img = bpy.data.images.load(template_path)
+        dims = (img.size[0], img.size[1])
+        bpy.data.images.remove(img)
+        return dims
+    except:
+        return None, None
+
+
+def find_template_opencv(texture_path, template_path, threshold=0.7, check_rotations=True):
+    """
+    Use OpenCV for fast, accurate template matching.
+    Handles multiple scales and rotations.
+    Returns (found, best_score, best_scale, best_rotation)
+    """
+    if not OPENCV_AVAILABLE:
+        return False, 0, 1.0, 0
+
+    try:
+        # Load images
+        texture = cv2.imread(texture_path, cv2.IMREAD_UNCHANGED)
+        template = cv2.imread(template_path, cv2.IMREAD_UNCHANGED)
+
+        if texture is None or template is None:
+            return False, 0, 1.0, 0
+
+        # Convert to grayscale for matching
+        if len(texture.shape) == 3:
+            tex_gray = cv2.cvtColor(texture, cv2.COLOR_BGR2GRAY)
+        else:
+            tex_gray = texture
+
+        if len(template.shape) == 3:
+            tpl_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+        else:
+            tpl_gray = template
+
+        best_score = 0
+        best_scale = 1.0
+        best_rotation = 0
+
+        # Try different scales
+        scales = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0]
+        rotations = [0, 90, 180, 270] if check_rotations else [0]
+
+        for rotation in rotations:
+            # Rotate template
+            if rotation == 0:
+                tpl_rotated = tpl_gray
+            else:
+                center = (tpl_gray.shape[1] // 2, tpl_gray.shape[0] // 2)
+                matrix = cv2.getRotationMatrix2D(center, rotation, 1.0)
+                tpl_rotated = cv2.warpAffine(tpl_gray, matrix, (tpl_gray.shape[1], tpl_gray.shape[0]))
+
+            for scale in scales:
+                # Resize template
+                new_w = int(tpl_rotated.shape[1] * scale)
+                new_h = int(tpl_rotated.shape[0] * scale)
+
+                if new_w < 5 or new_h < 5:
+                    continue
+                if new_w > tex_gray.shape[1] or new_h > tex_gray.shape[0]:
+                    continue
+
+                tpl_scaled = cv2.resize(tpl_rotated, (new_w, new_h))
+
+                # Template matching
+                result = cv2.matchTemplate(tex_gray, tpl_scaled, cv2.TM_CCOEFF_NORMED)
+                _, max_val, _, _ = cv2.minMaxLoc(result)
+
+                if max_val > best_score:
+                    best_score = max_val
+                    best_scale = scale
+                    best_rotation = rotation
+
+                    # Early exit if very good match
+                    if best_score >= 0.9:
+                        return True, best_score, best_scale, best_rotation
+
+        return best_score >= threshold, best_score, best_scale, best_rotation
+
+    except Exception as e:
+        PrettyPrint(f"OpenCV matching error: {str(e)}", "warn")
+        return False, 0, 1.0, 0
+
+# Shape-based matching (scale and rotation invariant) - fallback if no OpenCV
+def extract_shape_silhouette(image_path, grid_size=12):
+    """
+    Extract a normalized silhouette from an image.
+    Returns a set of (x, y) grid positions that are filled, normalized to grid_size.
+    """
+    try:
+        img = bpy.data.images.load(image_path)
+        pixels = img.pixels[:]
+        w, h = img.size[0], img.size[1]
+        bpy.data.images.remove(img)
+
+        # Find bounding box of non-transparent pixels
+        min_x, max_x = w, 0
+        min_y, max_y = h, 0
+        filled_pixels = []
+
+        for y in range(h):
+            for x in range(w):
+                idx = (y * w + x) * 4
+                r, g, b, a = pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]
+                # Consider pixel filled if not transparent and not pure black
+                if a > 0.1 and (r > 0.1 or g > 0.1 or b > 0.1):
+                    filled_pixels.append((x, y))
+                    min_x = min(min_x, x)
+                    max_x = max(max_x, x)
+                    min_y = min(min_y, y)
+                    max_y = max(max_y, y)
+
+        if not filled_pixels or max_x <= min_x or max_y <= min_y:
+            return set()
+
+        # Normalize to grid
+        shape_w = max_x - min_x + 1
+        shape_h = max_y - min_y + 1
+
+        grid = set()
+        for x, y in filled_pixels:
+            gx = int((x - min_x) / shape_w * grid_size)
+            gy = int((y - min_y) / shape_h * grid_size)
+            gx = min(gx, grid_size - 1)
+            gy = min(gy, grid_size - 1)
+            grid.add((gx, gy))
+
+        return grid
+
+    except Exception as e:
+        PrettyPrint(f"Error extracting shape: {str(e)}", "warn")
+        return set()
+
+def rotate_shape_90(shape, grid_size=12):
+    """Rotate shape 90 degrees clockwise."""
+    return {(grid_size - 1 - y, x) for x, y in shape}
+
+def get_all_rotations(shape, grid_size=12):
+    """Get all 4 rotations of a shape."""
+    rotations = [shape]
+    current = shape
+    for _ in range(3):
+        current = rotate_shape_90(current, grid_size)
+        rotations.append(current)
+    return rotations
+
+def shape_similarity(shape1, shape2, check_density=True):
+    """
+    Calculate similarity between two shapes.
+    Uses Jaccard similarity AND density check to avoid matching
+    large solid shapes that "contain" smaller shapes.
+    """
+    if not shape1 or not shape2:
+        return 0
+
+    # Jaccard similarity (intersection over union)
+    intersection = len(shape1 & shape2)
+    union = len(shape1 | shape2)
+    jaccard = intersection / union if union > 0 else 0
+
+    if not check_density:
+        return jaccard
+
+    # Density check: shapes should have similar number of filled cells
+    # This prevents a large solid rectangle from matching a small arrow
+    size1, size2 = len(shape1), len(shape2)
+    size_ratio = min(size1, size2) / max(size1, size2) if max(size1, size2) > 0 else 0
+
+    # Combined score: both Jaccard AND density must be good
+    # Require density ratio > 0.5 (shapes within 2x size of each other)
+    if size_ratio < 0.4:
+        return jaccard * 0.3  # Heavily penalize size mismatch
+
+    return jaccard * (0.5 + 0.5 * size_ratio)  # Boost score for similar sizes
+
+def find_shape_in_texture(texture_path, template_shapes, grid_size=12, threshold=0.6, scales=[0.5, 0.75, 1.0, 1.5, 2.0]):
+    """
+    Search for a shape in a texture at multiple scales and rotations.
+    template_shapes: list of rotated versions of the template shape
+    Returns (found, best_score)
+    """
+    try:
+        img = bpy.data.images.load(texture_path)
+        pixels = img.pixels[:]
+        tex_w, tex_h = img.size[0], img.size[1]
+        bpy.data.images.remove(img)
+
+        best_score = 0
+
+        # Estimate template size from grid density
+        template_size = int(grid_size * 3)  # Base search window
+
+        for scale in scales:
+            window_size = int(template_size * scale)
+            if window_size < 8 or window_size > min(tex_w, tex_h):
+                continue
+
+            step = max(4, window_size // 3)
+
+            for wy in range(0, tex_h - window_size, step):
+                for wx in range(0, tex_w - window_size, step):
+                    # Extract shape from this window
+                    window_filled = set()
+                    has_content = False
+
+                    for ly in range(0, window_size, max(1, window_size // grid_size)):
+                        for lx in range(0, window_size, max(1, window_size // grid_size)):
+                            px, py = wx + lx, wy + ly
+                            if px >= tex_w or py >= tex_h:
+                                continue
+                            idx = (py * tex_w + px) * 4
+                            if idx + 3 >= len(pixels):
+                                continue
+                            r, g, b, a = pixels[idx], pixels[idx+1], pixels[idx+2], pixels[idx+3]
+                            if a > 0.1 and (r > 0.1 or g > 0.1 or b > 0.1):
+                                gx = int(lx / window_size * grid_size)
+                                gy = int(ly / window_size * grid_size)
+                                gx = min(gx, grid_size - 1)
+                                gy = min(gy, grid_size - 1)
+                                window_filled.add((gx, gy))
+                                has_content = True
+
+                    if not has_content or len(window_filled) < 5:
+                        continue
+
+                    # Compare against all rotations
+                    for template_shape in template_shapes:
+                        score = shape_similarity(window_filled, template_shape)
+                        if score > best_score:
+                            best_score = score
+                            if best_score >= threshold:
+                                return True, best_score
+
+        return best_score >= threshold, best_score
+
+    except Exception as e:
+        PrettyPrint(f"Error in shape matching: {str(e)}", "warn")
+        return False, 0
+
+# Texture search/scan tool to find textures across archives
+class TextureSearchOperator(Operator):
+    bl_label = "Search Textures"
+    bl_idname = "helldiver2.texture_search"
+    bl_description = "Scan archives for textures and export them for visual inspection. Useful for finding specific textures like UI elements"
+
+    directory: StringProperty(name="Output Directory", description="Directory to export textures to", subtype='DIR_PATH')
+    filter_folder: BoolProperty(default=True, options={"HIDDEN"})
+
+    min_width: IntProperty(name="Min Width", description="Minimum texture width (0 = no minimum)", default=0, min=0)
+    max_width: IntProperty(name="Max Width", description="Maximum texture width (0 = no maximum)", default=0, min=0)
+    min_height: IntProperty(name="Min Height", description="Minimum texture height (0 = no minimum)", default=0, min=0)
+    max_height: IntProperty(name="Max Height", description="Maximum texture height (0 = no maximum)", default=0, min=0)
+
+    scan_all_archives: BoolProperty(name="Scan All Archives", description="Scan all archives in game folder (slow but thorough)", default=False)
+    export_format: EnumProperty(
+        name="Export Format",
+        items=[
+            ('PNG', 'PNG', 'Export as PNG (viewable)'),
+            ('DDS', 'DDS', 'Export as DDS (original format)'),
+        ],
+        default='PNG'
+    )
+    generate_report: BoolProperty(name="Generate Report", description="Create a CSV report with texture metadata", default=True)
+
+    # UI Atlas filtering
+    filter_ui_atlas: BoolProperty(name="UI Atlas Filter", description="Only keep textures with black/transparent backgrounds (like UI atlases)", default=False)
+    black_threshold: FloatProperty(name="Black/Transparent %", description="Minimum percentage of black/transparent pixels (0.0-1.0)", default=0.5, min=0.0, max=1.0)
+    max_colors: IntProperty(name="Max Unique Colors", description="Maximum number of unique colors for UI atlas detection", default=100, min=1)
+
+    # Template matching (color-based)
+    use_template_match: BoolProperty(name="Color Match", description="Search for textures with similar colors to template", default=False)
+    template_path: StringProperty(name="Template Image", description="Path to template image to search for", subtype='FILE_PATH')
+    template_folder: StringProperty(name="Template Folder", description="Folder containing multiple template images to search for")
+    use_template_folder: BoolProperty(name="Use Folder", description="Use a folder of templates instead of a single image", default=False)
+    match_threshold: FloatProperty(name="Match Threshold", description="Minimum match quality (0.0-1.0)", default=0.8, min=0.0, max=1.0)
+
+    # Shape matching (scale/rotation invariant)
+    use_shape_match: BoolProperty(name="Shape Match", description="Search for similar shapes (works at any size/rotation)", default=False)
+    shape_threshold: FloatProperty(name="Shape Threshold", description="Minimum shape similarity (0.0-1.0)", default=0.5, min=0.0, max=1.0)
+
+    # Exact matching (perceptual hash - finds identical/near-identical textures)
+    use_exact_match: BoolProperty(name="Exact Match", description="Find textures that are identical or near-identical to template (highest priority)", default=False)
+    exact_threshold: FloatProperty(name="Exact Threshold", description="Minimum similarity for exact match (0.95+ for near-identical)", default=0.9, min=0.0, max=1.0)
+
+    # Contains matching (template appears within texture)
+    use_contains_match: BoolProperty(name="Contains Match", description="Find textures that contain the template image (for transparent overlays)", default=False)
+    contains_threshold: FloatProperty(name="Contains Threshold", description="Minimum match quality for containment", default=0.7, min=0.0, max=1.0)
+
+    # Resolution matching
+    filter_same_resolution: BoolProperty(name="Same Resolution", description="Only check textures with same dimensions as template", default=False)
+    prioritize_resolution: BoolProperty(name="Prioritize Resolution Match", description="Rank textures with matching resolution higher", default=True)
+
+    # Parallel processing
+    num_workers: IntProperty(name="Workers", description="Number of parallel workers (more = faster but uses more CPU/RAM)", default=8, min=1, max=32)
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row()
+        row.prop(self, "scan_all_archives")
+        row.prop(self, "num_workers")
+        layout.prop(self, "export_format")
+        layout.prop(self, "generate_report")
+
+        layout.separator()
+        layout.label(text="Dimension Filters (0 = no limit):")
+        row = layout.row()
+        row.prop(self, "min_width")
+        row.prop(self, "max_width")
+        row = layout.row()
+        row.prop(self, "min_height")
+        row.prop(self, "max_height")
+
+        layout.separator()
+        layout.label(text="UI Atlas Filter:")
+        layout.prop(self, "filter_ui_atlas")
+        if self.filter_ui_atlas:
+            row = layout.row()
+            row.prop(self, "black_threshold")
+            row.prop(self, "max_colors")
+
+        layout.separator()
+        layout.label(text="Template Input:")
+        row = layout.row()
+        row.prop(self, "use_template_folder")
+        if self.use_template_folder:
+            layout.prop(self, "template_folder")
+        else:
+            layout.prop(self, "template_path")
+
+        layout.separator()
+        layout.label(text="Matching Modes (ranked by likelihood):")
+
+        # Exact match - highest priority
+        box = layout.box()
+        box.label(text="1. Exact Match (Highest Priority)", icon='CHECKMARK')
+        row = box.row()
+        row.prop(self, "use_exact_match")
+        if self.use_exact_match:
+            row.prop(self, "exact_threshold")
+
+        # Contains match - second priority
+        box = layout.box()
+        box.label(text="2. Contains Match (Template in Texture)", icon='PIVOT_BOUNDBOX')
+        row = box.row()
+        row.prop(self, "use_contains_match")
+        if self.use_contains_match:
+            row.prop(self, "contains_threshold")
+            box.label(text="(For transparent overlays on backgrounds)", icon='INFO')
+
+        # Resolution matching
+        box = layout.box()
+        box.label(text="3. Resolution Match", icon='TEXTURE')
+        row = box.row()
+        row.prop(self, "filter_same_resolution")
+        row.prop(self, "prioritize_resolution")
+
+        # Shape/Color matching - lower priority
+        box = layout.box()
+        box.label(text="4. Shape/Color Match", icon='IMAGE_DATA')
+        row = box.row()
+        row.prop(self, "use_shape_match")
+        row.prop(self, "use_template_match")
+        if self.use_shape_match:
+            box.prop(self, "shape_threshold")
+        if self.use_template_match:
+            box.prop(self, "match_threshold")
+
+    def execute(self, context):
+        import time
+        import shutil
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        start_time = time.time()
+
+        # Initialize log file in output directory
+        log_path = os.path.join(self.directory, "log.txt")
+        SetLogFile(log_path)
+
+        # Log all search parameters at the start
+        PrettyPrint("=" * 60)
+        PrettyPrint("TEXTURE SEARCH PARAMETERS")
+        PrettyPrint("=" * 60)
+        PrettyPrint(f"Output directory: {self.directory}")
+        PrettyPrint(f"Export format: {self.export_format}")
+        PrettyPrint(f"Generate report: {self.generate_report}")
+        PrettyPrint(f"Scan all archives: {self.scan_all_archives}")
+        PrettyPrint(f"Parallel workers: {self.num_workers}")
+        PrettyPrint("")
+        PrettyPrint("--- Dimension Filters ---")
+        PrettyPrint(f"Min dimensions: {self.min_width}x{self.min_height}")
+        PrettyPrint(f"Max dimensions: {self.max_width}x{self.max_height}")
+        PrettyPrint("")
+        PrettyPrint("--- Template Settings ---")
+        PrettyPrint(f"Use template folder: {self.use_template_folder}")
+        if self.use_template_folder:
+            PrettyPrint(f"Template folder: {self.template_folder}")
+        else:
+            PrettyPrint(f"Template path: {self.template_path}")
+        PrettyPrint("")
+        PrettyPrint("--- Matching Modes ---")
+        PrettyPrint(f"Exact match: {self.use_exact_match} (threshold: {self.exact_threshold:.0%})")
+        PrettyPrint(f"Contains match: {self.use_contains_match} (threshold: {self.contains_threshold:.0%})")
+        PrettyPrint(f"Color match: {self.use_template_match} (threshold: {self.match_threshold:.0%})")
+        PrettyPrint(f"Shape match: {self.use_shape_match} (threshold: {self.shape_threshold:.0%})")
+        PrettyPrint(f"Same resolution filter: {self.filter_same_resolution}")
+        PrettyPrint(f"Prioritize resolution: {self.prioritize_resolution}")
+        PrettyPrint("")
+        PrettyPrint("--- UI Atlas Filter ---")
+        PrettyPrint(f"Filter UI atlas: {self.filter_ui_atlas}")
+        if self.filter_ui_atlas:
+            PrettyPrint(f"Black/transparent threshold: {self.black_threshold:.0%}")
+            PrettyPrint(f"Max unique colors: {self.max_colors}")
+        PrettyPrint("=" * 60)
+        PrettyPrint("")
+
+        if not Global_TocManager.ActiveArchive and not self.scan_all_archives:
+            PrettyPrint("ERROR: No archive loaded. Load an archive first or enable 'Scan All Archives'", "error")
+            CloseLogFile()
+            self.report({'ERROR'}, "No archive loaded. Load an archive first or enable 'Scan All Archives'")
+            return {'CANCELLED'}
+
+        # Check template path if any matching mode is enabled
+        needs_template = self.use_template_match or self.use_shape_match or self.use_exact_match or self.use_contains_match or self.filter_same_resolution or self.prioritize_resolution
+
+        # Collect template paths (single file or folder)
+        template_paths = []
+        if needs_template:
+            if self.use_template_folder:
+                if not self.template_folder or not os.path.isdir(self.template_folder):
+                    PrettyPrint(f"ERROR: Template folder mode enabled but no valid folder specified", "error")
+                    CloseLogFile()
+                    self.report({'ERROR'}, "Template folder mode enabled but no valid folder specified")
+                    return {'CANCELLED'}
+                # Scan folder for image files
+                valid_extensions = {'.png', '.jpg', '.jpeg', '.bmp', '.tga', '.tiff', '.dds'}
+                for filename in os.listdir(self.template_folder):
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext in valid_extensions:
+                        template_paths.append(os.path.join(self.template_folder, filename))
+                if not template_paths:
+                    PrettyPrint(f"ERROR: No image files found in template folder: {self.template_folder}", "error")
+                    CloseLogFile()
+                    self.report({'ERROR'}, f"No image files found in template folder: {self.template_folder}")
+                    return {'CANCELLED'}
+                PrettyPrint(f"Found {len(template_paths)} template images in folder")
+            else:
+                if not self.template_path or not os.path.exists(self.template_path):
+                    PrettyPrint(f"ERROR: Template matching enabled but no valid template image specified", "error")
+                    CloseLogFile()
+                    self.report({'ERROR'}, "Template matching enabled but no valid template image specified")
+                    return {'CANCELLED'}
+                template_paths = [self.template_path]
+
+        # Pre-compute data for all templates
+        templates_data = []  # List of dicts, one per template
+        temp_folder = get_temp_folder()
+        # Create dedicated subfolder for converted templates
+        template_convert_folder = os.path.join(temp_folder, "texture_search_templates")
+        if not os.path.exists(template_convert_folder):
+            os.makedirs(template_convert_folder)
+        converted_temps = []  # Track temp files to clean up later
+
+        PrettyPrint(f"Processing {len(template_paths)} templates...")
+        successful_conversions = 0
+        failed_conversions = 0
+
+        for tpl_idx, tpl_path in enumerate(template_paths):
+            tpl_name = os.path.basename(tpl_path)
+            tpl_ext = os.path.splitext(tpl_name)[1].lower()
+
+            # Convert DDS templates to PNG for processing
+            working_path = tpl_path
+            if tpl_ext == '.dds':
+                PrettyPrint(f"[{tpl_idx+1}/{len(template_paths)}] Converting DDS template '{tpl_name}'...")
+                temp_png = os.path.join(template_convert_folder, f"tpl_{os.path.splitext(tpl_name)[0]}.png")
+                result = subprocess.run([Global_texconvpath, "-y", "-o", template_convert_folder, "-ft", "png", "-f", "R8G8B8A8_UNORM", "-alpha", tpl_path], capture_output=True)
+                # texconv outputs with same base name
+                expected_output = os.path.join(template_convert_folder, f"{os.path.splitext(tpl_name)[0]}.png")
+                if os.path.exists(expected_output):
+                    working_path = expected_output
+                    converted_temps.append(expected_output)
+                    successful_conversions += 1
+                else:
+                    failed_conversions += 1
+                    stderr_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "No error message"
+                    PrettyPrint(f"  FAILED: {tpl_name} - {stderr_msg}", "WARN")
+                    continue
+
+            tpl_data = {'path': working_path, 'name': tpl_name, 'original_path': tpl_path}
+
+            # Get template dimensions for resolution filtering
+            tpl_data['width'], tpl_data['height'] = get_template_dimensions(working_path)
+            if tpl_data['width'] and tpl_data['height']:
+                PrettyPrint(f"Template '{tpl_name}' dimensions: {tpl_data['width']}x{tpl_data['height']}")
+
+            # Pre-compute template hash for exact matching
+            tpl_data['hash'] = None
+            tpl_data['histogram'] = None
+            if self.use_exact_match:
+                tpl_data['hash'] = compute_image_hash(working_path)
+                if tpl_data['hash'] is not None:
+                    PrettyPrint(f"Template '{tpl_name}' hash computed")
+                if OPENCV_AVAILABLE:
+                    tpl_data['histogram'] = compute_histogram(working_path)
+
+            # Pre-extract template colors for color matching
+            tpl_data['colors'] = {}
+            if self.use_template_match:
+                tpl_data['colors'] = extract_template_colors(working_path)
+                PrettyPrint(f"Template '{tpl_name}' has {len(tpl_data['colors'])} unique color signatures")
+
+            # Pre-extract shape silhouette and rotations for shape matching (fallback only)
+            tpl_data['shapes'] = []
+            if self.use_shape_match and not OPENCV_AVAILABLE:
+                base_shape = extract_shape_silhouette(working_path)
+                if base_shape:
+                    tpl_data['shapes'] = get_all_rotations(base_shape)
+                    PrettyPrint(f"Template '{tpl_name}' shape: {len(base_shape)} grid cells")
+
+            templates_data.append(tpl_data)
+
+        # Log template processing summary
+        if self.use_template_folder:
+            PrettyPrint(f"Template conversion summary: {successful_conversions} succeeded, {failed_conversions} failed, {len(templates_data)} ready for matching")
+            if failed_conversions > 0:
+                PrettyPrint(f"  Note: Failed templates will be skipped during search", "WARN")
+
+        # For backwards compatibility, also set single-template variables (use first template)
+        template_width, template_height = None, None
+        template_hash = None
+        template_histogram = None
+        template_colors = {}
+        template_shapes = []
+        if templates_data:
+            template_width = templates_data[0]['width']
+            template_height = templates_data[0]['height']
+            template_hash = templates_data[0]['hash']
+            template_histogram = templates_data[0]['histogram']
+            template_colors = templates_data[0]['colors']
+            template_shapes = templates_data[0]['shapes']
+
+        # Thread-safe counters
+        lock = threading.Lock()
+        counters = {
+            'exported': 0, 'skipped_dims': 0, 'skipped_ui': 0,
+            'skipped_color': 0, 'skipped_shape': 0, 'skipped_exact': 0,
+            'skipped_contains': 0, 'skipped_resolution': 0,
+            'errors': 0, 'processed': 0
+        }
+        report_data = []
+        matches_found = []
+
+        # Store settings for worker threads
+        # Use global temp folder setting
+        temp_folder = get_temp_folder()
+        PrettyPrint(f"Using temp folder: {temp_folder}")
+        settings = {
+            'output_dir': self.directory,
+            'temp_dir': temp_folder,
+            'export_format': self.export_format,
+            'filter_ui_atlas': self.filter_ui_atlas,
+            'black_threshold': self.black_threshold,
+            'max_colors': self.max_colors,
+            'use_template_match': self.use_template_match,
+            'template_colors': template_colors,
+            'match_threshold': self.match_threshold,
+            'use_shape_match': self.use_shape_match,
+            'template_path': self.template_path,
+            'template_shapes': template_shapes,
+            'shape_threshold': self.shape_threshold,
+            'generate_report': self.generate_report,
+            # New matching options
+            'use_exact_match': self.use_exact_match,
+            'exact_threshold': self.exact_threshold,
+            'template_hash': template_hash,
+            'template_histogram': template_histogram,
+            'use_contains_match': self.use_contains_match,
+            'contains_threshold': self.contains_threshold,
+            'filter_same_resolution': self.filter_same_resolution,
+            'prioritize_resolution': self.prioritize_resolution,
+            'template_width': template_width,
+            'template_height': template_height,
+            # Multi-template support
+            'templates_data': templates_data,
+        }
+
+        def process_texture(task):
+            """Worker function to process a single texture (thread-safe)"""
+            archive_name, file_id, dds_data, width, height, tex_format = task
+
+            try:
+                templates = settings['templates_data']
+
+                # Check resolution filter first (before any conversion - fast check)
+                # Match if texture matches ANY template's resolution
+                resolution_match = False
+                if templates:
+                    for tpl in templates:
+                        if tpl['width'] and tpl['height']:
+                            if width == tpl['width'] and height == tpl['height']:
+                                resolution_match = True
+                                break
+
+                # If strict resolution filter is enabled and doesn't match ANY template, skip
+                if settings['filter_same_resolution'] and not resolution_match:
+                    return ('skipped_resolution', None)
+
+                # Create unique temp files for this thread
+                thread_id = threading.current_thread().ident
+                tempdir = settings['temp_dir']
+                dds_path = os.path.join(tempdir, f"tmp_{thread_id}_{file_id}.dds")
+                temp_png = os.path.join(tempdir, f"tmp_{thread_id}_{file_id}.png")
+
+                # Write DDS
+                with open(dds_path, 'wb') as f:
+                    f.write(dds_data)
+
+                # Convert to PNG
+                subprocess.run([Global_texconvpath, "-y", "-o", tempdir, "-ft", "png", "-f", "R8G8B8A8_UNORM", "-alpha", dds_path], capture_output=True)
+
+                # texconv outputs with same name as input but .png extension
+                texconv_output = os.path.join(tempdir, f"tmp_{thread_id}_{file_id}.png")
+                if not os.path.exists(texconv_output):
+                    return ('error', None)
+                temp_png = texconv_output
+
+                if not os.path.exists(temp_png):
+                    return ('error', None)
+
+                # Apply UI atlas filter
+                if settings['filter_ui_atlas']:
+                    is_ui, _, _ = is_ui_atlas_texture_fast(temp_png, settings['black_threshold'], settings['max_colors'])
+                    if not is_ui:
+                        try: os.remove(temp_png)
+                        except: pass
+                        try: os.remove(dds_path)
+                        except: pass
+                        return ('skipped_ui', None)
+
+                # Initialize all scores
+                exact_score = 0.0
+                mse_score = 0.0  # MSE validation score for exact matches
+                contains_score = 0.0
+                match_score = 0.0
+                shape_score = 0.0
+                match_type = "none"
+                matched_template = None  # Track which template matched
+
+                # Track which filters passed
+                any_match_required = (settings['use_exact_match'] or settings['use_contains_match'] or
+                                      settings['use_template_match'] or settings['use_shape_match'])
+
+                # 1. EXACT MATCH - Highest priority (perceptual hash comparison)
+                # Check against ALL templates, match if ANY matches
+                if settings['use_exact_match']:
+                    # Skip textures that are too small - they produce unreliable hashes
+                    # Minimum 32x32 to have meaningful content for hashing
+                    min_hash_size = 32
+                    if width < min_hash_size or height < min_hash_size:
+                        # Too small for reliable exact matching
+                        if any_match_required and not (settings['use_contains_match'] or
+                                                       settings['use_template_match'] or settings['use_shape_match']):
+                            try: os.remove(temp_png)
+                            except: pass
+                            try: os.remove(dds_path)
+                            except: pass
+                            return ('skipped_exact', None)
+                    else:
+                        texture_hash = compute_image_hash(temp_png)
+                        if texture_hash is not None:
+                            for tpl in templates:
+                                if tpl['hash'] is not None:
+                                    # Exact match requires same resolution
+                                    if tpl.get('width') and tpl.get('height'):
+                                        if width != tpl['width'] or height != tpl['height']:
+                                            continue  # Skip templates with different resolution
+                                    # Only use perceptual hash - histogram can cause false positives
+                                    score = hash_similarity(tpl['hash'], texture_hash)
+                                    if score >= settings['exact_threshold'] and score > exact_score:
+                                        # Validate with MSE to filter false positives
+                                        # Hash similarity can match different images with similar structure
+                                        mse_sim = compute_mse_similarity(temp_png, tpl['path'])
+                                        if mse_sim >= 0.92:  # Require 92% SSIM+contrast similarity
+                                            exact_score = score
+                                            mse_score = mse_sim
+                                            matched_template = tpl['name']
+
+                    if exact_score >= settings['exact_threshold']:
+                        match_type = "exact"
+                    elif any_match_required and not (settings['use_contains_match'] or
+                                                     settings['use_template_match'] or settings['use_shape_match']):
+                        # Only exact match enabled and it failed
+                        try: os.remove(temp_png)
+                        except: pass
+                        try: os.remove(dds_path)
+                        except: pass
+                        return ('skipped_exact', None)
+
+                # 2. CONTAINS MATCH - Check if ANY template is contained within texture
+                if settings['use_contains_match'] and match_type != "exact":
+                    for tpl in templates:
+                        found, score, _ = find_template_contained(temp_png, tpl['path'],
+                                                                  threshold=settings['contains_threshold'])
+                        if found and score > contains_score:
+                            contains_score = score
+                            matched_template = tpl['name']
+                            match_type = "contains"
+
+                    if match_type != "contains" and any_match_required and not (settings['use_template_match'] or settings['use_shape_match']):
+                        # Only contains match enabled (besides exact which may have failed)
+                        if not settings['use_exact_match'] or exact_score < settings['exact_threshold']:
+                            try: os.remove(temp_png)
+                            except: pass
+                            try: os.remove(dds_path)
+                            except: pass
+                            return ('skipped_contains', None)
+
+                # 3. COLOR MATCH - Check against ALL templates
+                if settings['use_template_match'] and match_type not in ["exact", "contains"]:
+                    for tpl in templates:
+                        if tpl['colors']:
+                            found, score = match_texture_to_template(temp_png, tpl['colors'],
+                                                                      settings['match_threshold'])
+                            if found and score > match_score:
+                                match_score = score
+                                matched_template = tpl['name']
+                                match_type = "color"
+
+                    if match_type != "color" and any_match_required and not settings['use_shape_match']:
+                        try: os.remove(temp_png)
+                        except: pass
+                        try: os.remove(dds_path)
+                        except: pass
+                        return ('skipped_color', None)
+
+                # 4. SHAPE MATCH - Check against ALL templates
+                if settings['use_shape_match'] and match_type not in ["exact", "contains", "color"]:
+                    for tpl in templates:
+                        if OPENCV_AVAILABLE and cv2 is not None:
+                            found, score, _, _ = find_template_opencv(temp_png, tpl['path'],
+                                                                      threshold=settings['shape_threshold'],
+                                                                      check_rotations=True)
+                        else:
+                            if tpl['shapes']:
+                                found, score = find_shape_in_texture(temp_png, tpl['shapes'],
+                                                                      threshold=settings['shape_threshold'])
+                            else:
+                                found, score = False, 0
+                        if found and score > shape_score:
+                            shape_score = score
+                            matched_template = tpl['name']
+                            match_type = "shape"
+
+                    if match_type != "shape" and any_match_required:
+                        try: os.remove(temp_png)
+                        except: pass
+                        try: os.remove(dds_path)
+                        except: pass
+                        return ('skipped_shape', None)
+
+                # If no matching modes enabled but we got here, it's a general export
+                if not any_match_required:
+                    match_type = "export"
+
+                # If all enabled filters failed, skip
+                if any_match_required and match_type == "none":
+                    try: os.remove(temp_png)
+                    except: pass
+                    try: os.remove(dds_path)
+                    except: pass
+                    return ('skipped_shape', None)
+
+                # Compute composite ranking score (higher = better match)
+                # Priority: exact > contains > resolution > color > shape
+                rank_score = 0.0
+                if match_type == "exact":
+                    rank_score = 1000.0 + exact_score * 100  # 1000-1100
+                elif match_type == "contains":
+                    rank_score = 800.0 + contains_score * 100  # 800-900
+                elif resolution_match:
+                    rank_score = 600.0 + max(match_score, shape_score) * 100  # 600-700
+                elif match_type == "color":
+                    rank_score = 400.0 + match_score * 100  # 400-500
+                elif match_type == "shape":
+                    rank_score = 200.0 + shape_score * 100  # 200-300
+                else:
+                    rank_score = 100.0  # General export
+
+                # Boost score if resolution matches (when prioritize_resolution is enabled)
+                if settings['prioritize_resolution'] and resolution_match:
+                    rank_score += 50.0
+
+                # MATCH! Export it
+                filename = f"{archive_name}_{file_id}"
+                if settings['export_format'] == 'PNG':
+                    png_output = os.path.join(settings['output_dir'], f"{filename}.png")
+                    shutil.copy2(temp_png, png_output)
+                else:
+                    dds_output = os.path.join(settings['output_dir'], f"{filename}.dds")
+                    shutil.copy2(dds_path, dds_output)
+
+                # Cleanup
+                try: os.remove(temp_png)
+                except: pass
+                try: os.remove(dds_path)
+                except: pass
+
+                result_data = {
+                    'archive': archive_name,
+                    'file_id': str(file_id),
+                    'hex_id': hex(file_id),
+                    'width': width,
+                    'height': height,
+                    'format': tex_format,
+                    'filename': filename,
+                    'match_type': match_type,
+                    'matched_template': matched_template or '',
+                    'exact_score': exact_score,
+                    'mse_score': mse_score,
+                    'contains_score': contains_score,
+                    'match_score': match_score,
+                    'shape_score': shape_score,
+                    'resolution_match': resolution_match,
+                    'rank_score': rank_score
+                }
+                return ('match', result_data)
+
+            except Exception as e:
+                return ('error', str(e))
+
+        # Determine which archives to scan
+        archives_to_scan = []
+        if self.scan_all_archives:
+            if len(Global_TocManager.SearchArchives) > 0:
+                archives_to_scan = Global_TocManager.SearchArchives
+            else:
+                PrettyPrint("ERROR: No search archives available. Load at least one archive first to populate the search index", "error")
+                CloseLogFile()
+                self.report({'ERROR'}, "No search archives available. Load at least one archive first to populate the search index")
+                return {'CANCELLED'}
+        else:
+            archives_to_scan = Global_TocManager.LoadedArchives
+
+        total_archives = len(archives_to_scan)
+        PrettyPrint(f"=== TEXTURE SEARCH STARTED (Parallel: {self.num_workers} workers) ===")
+        PrettyPrint(f"Archives to scan: {total_archives}")
+        PrettyPrint(f"Filters: Dimensions={self.min_width}x{self.min_height} to {self.max_width}x{self.max_height}")
+
+        # Build match modes string
+        modes = []
+        if self.use_exact_match:
+            modes.append(f"Exact(>={self.exact_threshold:.0%})")
+        if self.use_contains_match:
+            modes.append(f"Contains(>={self.contains_threshold:.0%})")
+        if self.filter_same_resolution:
+            modes.append("SameResolution(strict)")
+        elif self.prioritize_resolution:
+            modes.append("Resolution(prioritize)")
+        if self.use_template_match:
+            modes.append(f"Color(>={self.match_threshold:.0%})")
+        if self.use_shape_match:
+            modes.append(f"Shape(>={self.shape_threshold:.0%})")
+        if self.filter_ui_atlas:
+            modes.append("UIAtlas")
+
+        if modes:
+            PrettyPrint(f"Match modes (priority order): {' > '.join(modes)}")
+        else:
+            PrettyPrint(f"No matching modes enabled - exporting all textures")
+
+        # Log template information
+        if templates_data:
+            if self.use_template_folder:
+                PrettyPrint(f"Template folder: {self.template_folder}")
+                PrettyPrint(f"Templates loaded: {len(templates_data)}")
+                for tpl in templates_data:
+                    dims = f"{tpl['width']}x{tpl['height']}" if tpl.get('width') and tpl.get('height') else "unknown dims"
+                    PrettyPrint(f"  - {tpl['name']} ({dims})")
+            else:
+                PrettyPrint(f"Template: {self.template_path} ({template_width}x{template_height})")
+
+        if self.use_shape_match or self.use_contains_match or self.use_exact_match:
+            opencv_status = "OpenCV (fast/accurate)" if (OPENCV_AVAILABLE and cv2 is not None) else "Fallback (slower)"
+            PrettyPrint(f"Matching engine: {opencv_status}")
+
+        # Process archives in batches to avoid memory explosion
+        import gc
+        BATCH_SIZE = 50  # Process 50 archives at a time, then free memory
+
+        total_processed = 0
+        PrettyPrint(f"Processing {total_archives} archives in batches of {BATCH_SIZE}...")
+
+        for batch_start in range(0, total_archives, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total_archives)
+            batch_archives = archives_to_scan[batch_start:batch_end]
+
+            PrettyPrint(f"=== Batch {batch_start//BATCH_SIZE + 1}: Archives {batch_start+1}-{batch_end} of {total_archives} ===")
+
+            # Collect tasks for this batch only
+            batch_tasks = []
+
+            for arch_idx, archive in enumerate(batch_archives):
+                archive_name = Path(archive.Path).stem if hasattr(archive, 'Path') else "unknown"
+
+                # Get texture entries from this archive
+                tex_file_ids = []
+                loaded_archive = None
+
+                if hasattr(archive, 'TocDict'):
+                    # Already a full archive with entries
+                    loaded_archive = archive
+                    tex_entries = list(archive.TocDict.get(TexID, {}).values())
+                    for entry in tex_entries:
+                        tex_file_ids.append(entry.FileID)
+                elif hasattr(archive, 'TocEntries'):
+                    # SearchToc - need to load the archive ONCE
+                    tex_file_ids = archive.TocEntries.get(TexID, [])
+                    if len(tex_file_ids) > 0:
+                        try:
+                            loaded_archive = Global_TocManager.LoadArchive(archive.Path, SetActive=False)
+                        except Exception as e:
+                            PrettyPrint(f"  Skipping archive {archive_name} - load error", 'WARN')
+                            counters['errors'] += 1
+                            continue
+
+                if len(tex_file_ids) == 0 or loaded_archive is None:
+                    continue
+
+                for file_id in tex_file_ids:
+                    try:
+                        entry = loaded_archive.GetEntry(file_id, TexID)
+                        if entry is None:
+                            continue
+
+                        if not entry.IsLoaded:
+                            entry.Load(False, False)
+
+                        if entry.LoadedData is None:
+                            counters['errors'] += 1
+                            continue
+
+                        tex = entry.LoadedData
+                        width = tex.Width
+                        height = tex.Height
+                        tex_format = tex.Format
+
+                        # Apply dimension filters (fast, do it here)
+                        if self.min_width > 0 and width < self.min_width:
+                            counters['skipped_dims'] += 1
+                            continue
+                        if self.max_width > 0 and width > self.max_width:
+                            counters['skipped_dims'] += 1
+                            continue
+                        if self.min_height > 0 and height < self.min_height:
+                            counters['skipped_dims'] += 1
+                            continue
+                        if self.max_height > 0 and height > self.max_height:
+                            counters['skipped_dims'] += 1
+                            continue
+
+                        # Get DDS data for parallel processing
+                        dds_data = tex.ToDDS()
+                        batch_tasks.append((archive_name, file_id, dds_data, width, height, tex_format))
+                        counters['processed'] += 1
+
+                    except Exception as e:
+                        counters['errors'] += 1
+
+            # Process this batch
+            if len(batch_tasks) > 0:
+                archive_pct = (batch_end / total_archives) * 100
+                PrettyPrint(f"  Processing {len(batch_tasks)} textures... ({archive_pct:.0f}% of archives)")
+
+                batch_total = len(batch_tasks)
+                with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                    futures = {executor.submit(process_texture, task): task for task in batch_tasks}
+
+                    batch_processed = 0
+                    for future in as_completed(futures):
+                        total_processed += 1
+                        batch_processed += 1
+                        result_type, result_data = future.result()
+
+                        # Log progress every 50 textures or at completion
+                        if batch_processed % 50 == 0 or batch_processed == batch_total:
+                            pct = (batch_processed / batch_total) * 100
+                            PrettyPrint(f"    {batch_processed}/{batch_total} ({pct:.0f}%) - Matches: {counters['exported']}")
+
+                        with lock:
+                            if result_type == 'match':
+                                counters['exported'] += 1
+                                matches_found.append(result_data)
+                                # Build score info string based on match type
+                                match_type = result_data.get('match_type', 'unknown')
+                                score_info = f" [{match_type.upper()}]"
+                                if result_data.get('resolution_match'):
+                                    score_info += " [RES]"
+                                if result_data.get('exact_score', 0) > 0:
+                                    score_info += f" exact={result_data['exact_score']:.2f}"
+                                if result_data.get('mse_score', 0) > 0:
+                                    score_info += f" mse={result_data['mse_score']:.2f}"
+                                if result_data.get('contains_score', 0) > 0:
+                                    score_info += f" contains={result_data['contains_score']:.2f}"
+                                if result_data.get('match_score', 0) > 0:
+                                    score_info += f" color={result_data['match_score']:.2f}"
+                                if result_data.get('shape_score', 0) > 0:
+                                    score_info += f" shape={result_data['shape_score']:.2f}"
+                                # Include matched template name for debugging
+                                tpl_info = ""
+                                if result_data.get('matched_template'):
+                                    tpl_info = f" tpl={result_data['matched_template']}"
+                                PrettyPrint(f"  MATCH: {result_data['file_id']} ({result_data['width']}x{result_data['height']}){score_info}{tpl_info}")
+                            elif result_type == 'skipped_ui':
+                                counters['skipped_ui'] += 1
+                            elif result_type == 'skipped_color':
+                                counters['skipped_color'] += 1
+                            elif result_type == 'skipped_shape':
+                                counters['skipped_shape'] += 1
+                            elif result_type == 'skipped_exact':
+                                counters['skipped_exact'] += 1
+                            elif result_type == 'skipped_contains':
+                                counters['skipped_contains'] += 1
+                            elif result_type == 'skipped_resolution':
+                                counters['skipped_resolution'] += 1
+                            elif result_type == 'error':
+                                counters['errors'] += 1
+
+            # Free memory after each batch - unload archives loaded during this batch
+            del batch_tasks
+            # Clear loaded archives to free memory (we're just searching, not modifying)
+            archives_to_keep = []  # Keep none - we're only searching
+            Global_TocManager.LoadedArchives = archives_to_keep
+            Global_TocManager.ActiveArchive = None
+            gc.collect()
+            PrettyPrint(f"  Batch complete. Total matches so far: {counters['exported']}")
+
+        # Write CSV report - SORTED BY LIKELIHOOD (rank_score)
+        if self.generate_report and len(matches_found) > 0:
+            # Sort matches by rank_score (highest first = most likely match)
+            matches_found.sort(key=lambda x: x.get('rank_score', 0), reverse=True)
+
+            report_path = os.path.join(self.directory, "texture_search_report.csv")
+            with open(report_path, 'w', newline='', encoding='utf-8') as csvfile:
+                import csv
+                # Always include base fields + ranking info
+                fieldnames = ['rank', 'match_type', 'matched_template', 'rank_score', 'archive', 'file_id', 'hex_id',
+                              'width', 'height', 'resolution_match', 'format', 'filename']
+                # Add score columns based on enabled modes
+                if self.use_exact_match:
+                    fieldnames.append('exact_score')
+                    fieldnames.append('mse_score')
+                if self.use_contains_match:
+                    fieldnames.append('contains_score')
+                if self.use_template_match:
+                    fieldnames.append('color_score')
+                if self.use_shape_match:
+                    fieldnames.append('shape_score')
+
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore')
+                writer.writeheader()
+
+                for idx, row in enumerate(matches_found, 1):
+                    # Add rank number
+                    row['rank'] = idx
+                    # Format scores for display
+                    row['rank_score'] = f"{row.get('rank_score', 0):.1f}"
+                    row['resolution_match'] = "YES" if row.get('resolution_match') else "no"
+                    if self.use_exact_match:
+                        row['exact_score'] = f"{row.get('exact_score', 0):.3f}"
+                        row['mse_score'] = f"{row.get('mse_score', 0):.3f}"
+                    if self.use_contains_match:
+                        row['contains_score'] = f"{row.get('contains_score', 0):.3f}"
+                    if self.use_template_match:
+                        row['color_score'] = f"{row.get('match_score', 0):.3f}"
+                    if self.use_shape_match:
+                        row['shape_score'] = f"{row.get('shape_score', 0):.3f}"
+                    writer.writerow(row)
+
+            PrettyPrint(f"Report written to: {report_path}")
+            PrettyPrint(f"Results sorted by likelihood - check rank #1 first!")
+
+        elapsed = time.time() - start_time
+        PrettyPrint(f"=== TEXTURE SEARCH COMPLETE ===")
+        PrettyPrint(f"Time: {elapsed:.1f}s | Processed: {counters['processed']} | Exported: {counters['exported']}")
+        skip_info = f"Skipped - Dims: {counters['skipped_dims']} | UI: {counters['skipped_ui']}"
+        if self.use_exact_match:
+            skip_info += f" | Exact: {counters['skipped_exact']}"
+        if self.use_contains_match:
+            skip_info += f" | Contains: {counters['skipped_contains']}"
+        if self.filter_same_resolution:
+            skip_info += f" | Resolution: {counters['skipped_resolution']}"
+        skip_info += f" | Color: {counters['skipped_color']} | Shape: {counters['skipped_shape']} | Errors: {counters['errors']}"
+        PrettyPrint(skip_info)
+
+        # Cleanup converted DDS template temp files
+        for temp_file in converted_temps:
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+        # Try to remove the template folder if empty
+        try:
+            os.rmdir(template_convert_folder)
+        except:
+            pass  # Folder not empty or doesn't exist
+
+        summary = f"Exported {counters['exported']} textures in {elapsed:.1f}s"
+        self.report({'INFO'}, summary)
+
+        # Close log file
+        PrettyPrint(f"Log saved to: {log_path}")
+        CloseLogFile()
+
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+# Mesh search tool to find meshes across archives by polygon indices fingerprint
+class MeshSearchOperator(Operator):
+    bl_label = "Search Mesh"
+    bl_idname = "helldiver2.mesh_search"
+    bl_description = "Search archives for meshes matching the selected Blender object (using polygon indices as fingerprint)"
+
+    scan_all_archives: BoolProperty(name="Scan All Archives", description="Scan all archives in game folder", default=False)
+    match_threshold: FloatProperty(name="Match Threshold", description="Minimum percentage of matching polygons (0.0-1.0)", default=0.95, min=0.0, max=1.0)
+    num_workers: IntProperty(name="Workers", description="Number of parallel workers", default=8, min=1, max=32)
+
+    def draw(self, context):
+        layout = self.layout
+        row = layout.row()
+        row.prop(self, "scan_all_archives")
+        row.prop(self, "num_workers")
+        layout.prop(self, "match_threshold")
+
+        layout.separator()
+        layout.label(text="Selected Object Info:")
+        obj = context.active_object
+        if obj and obj.type == 'MESH':
+            mesh = obj.data
+            layout.label(text=f"  Name: {obj.name}")
+            layout.label(text=f"  Vertices: {len(mesh.vertices)}")
+            layout.label(text=f"  Polygons: {len(mesh.polygons)}")
+        else:
+            layout.label(text="  No mesh selected!", icon='ERROR')
+
+    @classmethod
+    def poll(cls, context):
+        return context.active_object and context.active_object.type == 'MESH'
+
+    def execute(self, context):
+        import time
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        start_time = time.time()
+
+        if not Global_TocManager.ActiveArchive and not self.scan_all_archives:
+            self.report({'ERROR'}, "No archive loaded. Load an archive first or enable 'Scan All Archives'")
+            return {'CANCELLED'}
+
+        # Get selected mesh and extract polygon indices fingerprint
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'ERROR'}, "No mesh object selected")
+            return {'CANCELLED'}
+
+        mesh = obj.data
+        target_polys = tuple(tuple(p.vertices) for p in mesh.polygons)
+        target_poly_set = set(target_polys)
+        target_vert_count = len(mesh.vertices)
+        target_poly_count = len(mesh.polygons)
+
+        PrettyPrint(f"=== MESH SEARCH STARTED ===")
+        PrettyPrint(f"Target mesh: {obj.name}")
+        PrettyPrint(f"Target vertices: {target_vert_count}, polygons: {target_poly_count}")
+        PrettyPrint(f"Match threshold: {self.match_threshold:.0%}")
+
+        # Thread-safe storage
+        lock = threading.Lock()
+        matches_found = []
+        counters = {'processed': 0, 'errors': 0, 'units_checked': 0}
+
+        def compute_match_score(unit_polys):
+            """Compute percentage of matching polygons"""
+            if len(unit_polys) != target_poly_count:
+                return 0.0
+            unit_poly_set = set(unit_polys)
+            matching = len(target_poly_set & unit_poly_set)
+            return matching / target_poly_count if target_poly_count > 0 else 0.0
+
+        def process_unit(task):
+            """Worker function to check a single unit mesh"""
+            archive_name, file_id, entry = task
+            try:
+                # Load without creating Blender objects
+                if not entry.IsLoaded:
+                    entry.Load(Reload=False, MakeBlendObject=False, LoadMaterialSlotNames=False)
+
+                if entry.LoadedData is None:
+                    return ('error', None)
+
+                stingray_mesh = entry.LoadedData
+                results = []
+
+                # Check each RawMesh in the unit
+                for mesh_idx, raw_mesh in enumerate(stingray_mesh.RawMeshes):
+                    # Quick filter: vertex count must match
+                    vert_count = len(raw_mesh.VertexPositions)
+                    poly_count = len(raw_mesh.Indices)
+
+                    if vert_count != target_vert_count or poly_count != target_poly_count:
+                        continue
+
+                    # Extract polygon indices
+                    unit_polys = tuple(tuple(idx) for idx in raw_mesh.Indices)
+
+                    # Compute match score
+                    score = compute_match_score(unit_polys)
+
+                    if score >= self.match_threshold:
+                        results.append({
+                            'archive': archive_name,
+                            'file_id': file_id,
+                            'file_id_hex': hex(file_id),
+                            'mesh_index': mesh_idx,
+                            'lod_index': raw_mesh.LodIndex,
+                            'score': score,
+                            'vert_count': vert_count,
+                            'poly_count': poly_count,
+                        })
+
+                return ('matches', results)
+
+            except Exception as e:
+                return ('error', str(e))
+
+        # Determine which archives to scan
+        archives_to_scan = []
+        if self.scan_all_archives:
+            if len(Global_TocManager.SearchArchives) > 0:
+                archives_to_scan = Global_TocManager.SearchArchives
+            else:
+                self.report({'ERROR'}, "No search archives available. Load at least one archive first")
+                return {'CANCELLED'}
+        else:
+            archives_to_scan = Global_TocManager.LoadedArchives
+
+        total_archives = len(archives_to_scan)
+        PrettyPrint(f"Archives to scan: {total_archives}")
+
+        # Collect all unit tasks
+        all_tasks = []
+
+        for archive in archives_to_scan:
+            archive_name = Path(archive.Path).stem if hasattr(archive, 'Path') else "unknown"
+
+            unit_file_ids = []
+            loaded_archive = None
+
+            if hasattr(archive, 'TocDict'):
+                loaded_archive = archive
+                unit_entries = list(archive.TocDict.get(UnitID, {}).values())
+                for entry in unit_entries:
+                    unit_file_ids.append(entry.FileID)
+            elif hasattr(archive, 'TocEntries'):
+                unit_file_ids = archive.TocEntries.get(UnitID, [])
+                if len(unit_file_ids) > 0:
+                    try:
+                        loaded_archive = Global_TocManager.LoadArchive(archive.Path, SetActive=False)
+                    except Exception as e:
+                        PrettyPrint(f"  Skipping archive {archive_name} - load error", 'WARN')
+                        counters['errors'] += 1
+                        continue
+
+            if len(unit_file_ids) == 0 or loaded_archive is None:
+                continue
+
+            for file_id in unit_file_ids:
+                try:
+                    entry = loaded_archive.GetEntry(file_id, UnitID)
+                    if entry is not None:
+                        all_tasks.append((archive_name, file_id, entry))
+                except:
+                    counters['errors'] += 1
+
+        PrettyPrint(f"Units to check: {len(all_tasks)}")
+
+        # Process units in parallel
+        if len(all_tasks) > 0:
+            with ThreadPoolExecutor(max_workers=self.num_workers) as executor:
+                futures = {executor.submit(process_unit, task): task for task in all_tasks}
+
+                for future in as_completed(futures):
+                    counters['units_checked'] += 1
+
+                    if counters['units_checked'] % 100 == 0:
+                        PrettyPrint(f"  Checked {counters['units_checked']}/{len(all_tasks)} units...")
+
+                    result_type, result_data = future.result()
+
+                    if result_type == 'matches' and result_data:
+                        with lock:
+                            matches_found.extend(result_data)
+                    elif result_type == 'error':
+                        counters['errors'] += 1
+
+        # Sort matches by score
+        matches_found.sort(key=lambda x: x['score'], reverse=True)
+
+        # Report results
+        elapsed = time.time() - start_time
+        PrettyPrint(f"=== MESH SEARCH COMPLETE ===")
+        PrettyPrint(f"Time: {elapsed:.1f}s | Units checked: {counters['units_checked']} | Errors: {counters['errors']}")
+        PrettyPrint(f"Matches found: {len(matches_found)}")
+
+        if len(matches_found) > 0:
+            PrettyPrint(f"\n=== TOP MATCHES ===")
+            for i, match in enumerate(matches_found[:20]):
+                friendly_name = ""
+                for hash_entry in Global_ArchiveHashes:
+                    if hash_entry[0] == match['file_id_hex']:
+                        friendly_name = f" ({hash_entry[1]})"
+                        break
+                PrettyPrint(f"  #{i+1}: {match['file_id_hex']}{friendly_name}")
+                PrettyPrint(f"       Archive: {match['archive']}, Mesh #{match['mesh_index']}, LOD: {match['lod_index']}")
+                PrettyPrint(f"       Score: {match['score']:.1%}, Verts: {match['vert_count']}, Polys: {match['poly_count']}")
+
+            self.report({'INFO'}, f"Found {len(matches_found)} matching meshes. Check console for details.")
+        else:
+            self.report({'WARNING'}, f"No matching meshes found (checked {counters['units_checked']} units)")
+
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=400)
+
 # import texture from archive button
 class SaveTextureFromDDSOperator(Operator, ImportHelper):
     bl_label = "Import DDS"
@@ -3144,7 +8486,7 @@ def SaveImagePNG(filepath, object_id):
             # get texture data
             Entry.Load()
             StingrayTex = Entry.LoadedData
-            tempdir = tempfile.gettempdir()
+            tempdir = get_temp_folder()
             PrettyPrint(filepath)
             PrettyPrint(StingrayTex.Format)
             subprocess.run([Global_texconvpath, "-y", "-o", tempdir, "-ft", "dds", "-dx10", "-f", StingrayTex.Format, "-sepalpha", "-alpha", filepath], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
@@ -3182,6 +8524,253 @@ def SaveImageDDS(filepath, object_id):
             Entry.SetData(Toc.Data, Gpu.Data, Stream.Data, False)
 
             Global_TocManager.Save(int(object_id), TexID)
+
+# Batch opacity patching tool for texture search results
+class BatchOpacityPatchOperator(Operator):
+    bl_label = "Batch Patch Opacity"
+    bl_idname = "helldiver2.texture_batch_opacity"
+    bl_description = "Modify opacity of all textures from a Texture Search output folder"
+
+    directory: StringProperty(name="Input Directory", description="Directory containing texture files named {archive}_{file_id}.png/dds", subtype='DIR_PATH')
+    filter_folder: BoolProperty(default=True, options={"HIDDEN"})
+
+    opacity: FloatProperty(
+        name="Opacity",
+        description="Target opacity (0.0 = fully transparent, 1.0 = fully opaque)",
+        default=0.25,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR'
+    )
+
+    # Modal state variables
+    _timer = None
+    _texture_list = None  # List of (archive_hex, file_id, format) tuples
+    _texture_index = 0
+    _processed = 0
+    _failed = 0
+    _total = 0
+    _tempdir = None
+    _current_archive = None
+    _opacity_value = 0.25
+    _start_time = 0
+
+    def modal(self, context, event):
+        if event.type in {'ESC'}:
+            self.finish(context, cancelled=True)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            # Process one texture per timer tick
+            if self._texture_index >= len(self._texture_list):
+                self.finish(context, cancelled=False)
+                return {'FINISHED'}
+
+            # Get current texture info
+            archive_hex, file_id, tex_format = self._texture_list[self._texture_index]
+            self._texture_index += 1
+
+            # Update status
+            progress_pct = int((self._texture_index / self._total) * 100)
+            context.workspace.status_text_set(f"Batch Opacity: {self._texture_index}/{self._total} ({progress_pct}%) - Press ESC to cancel")
+
+            # Load archive if different from current
+            if archive_hex != self._current_archive:
+                archive_path = Global_gamepath + archive_hex
+                try:
+                    Global_TocManager.LoadArchive(archive_path, SetActive=False)
+                    self._current_archive = archive_hex
+                except Exception as e:
+                    PrettyPrint(f"Failed to load archive {archive_hex}: {str(e)}", 'ERROR')
+                    self._failed += 1
+                    return {'PASS_THROUGH'}
+
+            # Process the texture
+            try:
+                self.process_texture(file_id, tex_format)
+                self._processed += 1
+                PrettyPrint(f"Processed texture {file_id} ({self._processed}/{self._total})")
+            except Exception as e:
+                PrettyPrint(f"Error processing texture {file_id}: {str(e)}", 'ERROR')
+                self._failed += 1
+
+            return {'PASS_THROUGH'}
+
+        return {'PASS_THROUGH'}
+
+    def process_texture(self, file_id, tex_format):
+        """Process a single texture - modify its opacity and save to patch."""
+        # Get the entry
+        Entry = Global_TocManager.GetEntry(file_id, TexID)
+        if Entry is None:
+            raise Exception(f"Could not find texture entry {file_id}")
+
+        # Load the texture
+        Entry.Load()
+        StingrayTex = Entry.LoadedData
+
+        # Export to DDS then convert to PNG for processing
+        dds_path = f"{self._tempdir}/opacity_temp_{file_id}.dds"
+        png_path = f"{self._tempdir}/opacity_temp_{file_id}.png"
+        modified_png = f"{self._tempdir}/opacity_modified_{file_id}.png"
+
+        # Write DDS
+        with open(dds_path, 'w+b') as f:
+            f.write(StingrayTex.ToDDS())
+
+        # Convert to PNG for editing
+        subprocess.run([Global_texconvpath, "-y", "-o", self._tempdir, "-ft", "png", "-f", "R8G8B8A8_UNORM", "-sepalpha", "-alpha", dds_path],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+        if not os.path.exists(png_path):
+            raise Exception(f"Failed to convert texture {file_id} to PNG")
+
+        # Modify opacity using Blender's image API
+        img = bpy.data.images.load(png_path)
+        pixels = list(img.pixels)  # Get a mutable copy
+
+        # Check if this is a grayscale/no-alpha format (BC4, BC5, R8, etc.)
+        tex_format = StingrayTex.Format
+        is_grayscale_format = any(f in tex_format for f in ["BC4", "BC5", "R8_", "R16_", "R32_"])
+
+        opacity = self._opacity_value
+        if is_grayscale_format:
+            # For grayscale formats, modify RGB values since there's no real alpha channel
+            for i in range(0, len(pixels), 4):
+                pixels[i] = pixels[i] * opacity      # R
+                pixels[i+1] = pixels[i+1] * opacity  # G
+                pixels[i+2] = pixels[i+2] * opacity  # B
+        else:
+            # For formats with alpha, modify alpha channel (every 4th value starting at index 3)
+            for i in range(3, len(pixels), 4):
+                pixels[i] = pixels[i] * opacity
+
+        img.pixels = pixels
+        img.filepath_raw = modified_png
+        img.file_format = 'PNG'
+        img.save()
+        bpy.data.images.remove(img)
+
+        # Convert back to DDS with original format
+        subprocess.run([Global_texconvpath, "-y", "-o", self._tempdir, "-ft", "dds", "-dx10", "-f", StingrayTex.Format, "-sepalpha", "-alpha", modified_png],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+        # The output will have the same base name as input
+        expected_dds = f"{self._tempdir}/opacity_modified_{file_id}.dds"
+        if not os.path.exists(expected_dds):
+            raise Exception(f"Failed to convert modified texture {file_id} back to DDS")
+
+        # Load the modified DDS back into the entry
+        with open(expected_dds, 'r+b') as f:
+            StingrayTex.FromDDS(f.read())
+
+        # Serialize and save
+        Toc = MemoryStream(IOMode="write")
+        Gpu = MemoryStream(IOMode="write")
+        Stream = MemoryStream(IOMode="write")
+        StingrayTex.Serialize(Toc, Gpu, Stream)
+        Entry.SetData(Toc.Data, Gpu.Data, Stream.Data, False)
+
+        Global_TocManager.Save(file_id, TexID)
+
+        # Cleanup temp files
+        for temp_file in [dds_path, png_path, modified_png, expected_dds]:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
+
+    def finish(self, context, cancelled=False):
+        """Clean up and report results."""
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        context.workspace.status_text_set(None)
+
+        elapsed = time.time() - self._start_time
+        if cancelled:
+            self.report({'WARNING'}, f"Cancelled. Processed {self._processed}/{self._total} textures before cancellation.")
+        else:
+            self.report({'INFO'}, f"Done! Processed {self._processed} textures, {self._failed} failed. Opacity set to {int(self._opacity_value * 100)}%. Time: {elapsed:.1f}s")
+
+    def execute(self, context):
+        """Called after file browser selection - parse filenames and start modal."""
+        if PatchesNotLoaded(self):
+            return {'CANCELLED'}
+
+        # Scan directory for texture files and parse filenames
+        # Expected format: {archive_hex}_{file_id}.png or .dds
+        texture_list = []
+        valid_extensions = {'.png', '.dds'}
+
+        try:
+            for filename in os.listdir(self.directory):
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in valid_extensions:
+                    continue
+
+                # Parse filename: archive_hex_file_id.ext
+                basename = os.path.splitext(filename)[0]
+                parts = basename.split('_')
+
+                if len(parts) < 2:
+                    PrettyPrint(f"Skipping {filename} - invalid format (expected archive_fileid)", 'WARN')
+                    continue
+
+                # Archive is everything before the last underscore, file_id is after
+                archive_hex = '_'.join(parts[:-1])
+                file_id_str = parts[-1]
+
+                try:
+                    file_id = int(file_id_str)
+                except ValueError:
+                    PrettyPrint(f"Skipping {filename} - invalid file_id '{file_id_str}'", 'WARN')
+                    continue
+
+                # Format is unknown when parsing from filename, will be detected when loading
+                texture_list.append((archive_hex, file_id, ''))
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to scan directory: {str(e)}")
+            return {'CANCELLED'}
+
+        if not texture_list:
+            self.report({'ERROR'}, "No valid texture files found. Expected format: {archive}_{file_id}.png/dds")
+            return {'CANCELLED'}
+
+        # Sort by archive to minimize reloading
+        texture_list.sort(key=lambda x: x[0])
+
+        # Initialize modal state
+        self._texture_list = texture_list
+        self._texture_index = 0
+        self._processed = 0
+        self._failed = 0
+        self._total = len(texture_list)
+        self._tempdir = get_temp_folder()
+        self._current_archive = None
+        self._opacity_value = self.opacity
+        self._start_time = time.time()
+
+        PrettyPrint(f"Starting batch opacity patch: {self._total} textures, opacity={int(self._opacity_value * 100)}%")
+
+        # Start timer for modal processing
+        self._timer = context.window_manager.event_timer_add(0.01, window=context.window)
+        context.window_manager.modal_handler_add(self)
+
+        self.report({'INFO'}, f"Processing {self._total} textures... Press ESC to cancel")
+        return {'RUNNING_MODAL'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "opacity")
+        layout.label(text=f"Opacity: {int(self.opacity * 100)}%")
+
 #endregion
 
 #region Operators: Materials
@@ -3540,30 +9129,49 @@ class LoadArchivesOperator(Operator):
 class ManuallyLoadArchivesOperator(Operator):
     bl_label = "Load Archive By ID"
     bl_idname = "helldiver2.archives_import_manual"
-    bl_description = "Loads Archive by Archive ID"
+    bl_description = "Loads Archives by Archive ID (comma-separated for multiple)"
 
-    archive_id: StringProperty(name="Archive ID")
+    archive_id: StringProperty(name="Archive ID(s)", description="Enter archive IDs separated by commas")
     def execute(self, context):
         global Global_TocManager
 
-        ID = self.archive_id
-        if ID.startswith("0x"):
-            ID = hex_to_decimal(self.archive_id)
+        # Split by comma and strip whitespace
+        archive_ids = [aid.strip() for aid in self.archive_id.split(',') if aid.strip()]
 
-        path = os.path.join(Global_gamepath, ID)
+        if not archive_ids:
+            self.report({'ERROR'}, "No archive IDs provided")
+            return {'CANCELLED'}
 
-        if path != "" and (os.path.exists(path) or is_slim_version()):
-            Global_TocManager.LoadArchive(path)
-            name = f"{GetArchiveNameFromID(ID)} {ID}"
-            self.report({'INFO'}, f"Loaded {name}")
-            return{'FINISHED'}
+        loaded_count = 0
+        failed_count = 0
+        loaded_names = []
+
+        for archive_id in archive_ids:
+            ID = archive_id
+            if ID.startswith("0x"):
+                ID = hex_to_decimal(archive_id)
+
+            path = os.path.join(Global_gamepath, ID)
+
+            if path != "" and (os.path.exists(path) or is_slim_version()):
+                Global_TocManager.LoadArchive(path)
+                name = GetArchiveNameFromID(ID)
+                loaded_names.append(f"{name} ({ID})" if name else ID)
+                loaded_count += 1
+            else:
+                PrettyPrint(f"Failed to load archive: {ID}", "warn")
+                failed_count += 1
+
+        if loaded_count > 0:
+            if loaded_count == 1:
+                self.report({'INFO'}, f"Loaded {loaded_names[0]}")
+            else:
+                self.report({'INFO'}, f"Loaded {loaded_count} archives")
+            return {'FINISHED'}
         else:
-            message = "Archive Failed to Load"
-            if not os.path.exists(self.paths_str):
-                message = "Current Filepath is Invalid. Change This in Settings"
-            self.report({'ERROR'}, message )
-            return{'CANCELLED'}
-    
+            self.report({'ERROR'}, f"Failed to load {failed_count} archive(s)")
+            return {'CANCELLED'}
+
     def invoke(self, context, event):
         self.archive_id = ""
         return context.window_manager.invoke_props_dialog(self)
@@ -3571,6 +9179,7 @@ class ManuallyLoadArchivesOperator(Operator):
     def draw(self, context):
         layout = self.layout
         layout.prop(self, "archive_id")
+        layout.label(text="Separate multiple IDs with commas")
 
 class SearchArchivesOperator(Operator):
     bl_label = "Search Found Archives"
@@ -4262,6 +9871,25 @@ def ChangeSearchString(self, context):
             item.item_visible = not all([flag == 0 for flag in flt_flags])
             break
 
+def get_conflict_patches(self, context):
+    """Dynamic enum callback - returns patches that have this conflicting entry"""
+    if not self.patches:
+        return [("NONE", "None", "No patches")]
+    patches = self.patches.split(",")
+    return [(p, p, p) for p in patches]
+
+class ConflictItem(PropertyGroup):
+    """Stores information about a conflicting entry when combining patches"""
+    file_id: StringProperty(name="FileID")
+    type_id: StringProperty(name="TypeID")
+    friendly_name: StringProperty(name="Name")
+    patches: StringProperty(name="Patches")  # Comma-separated patch names
+    selected_patch: EnumProperty(
+        name="Winner",
+        items=get_conflict_patches,
+        description="Select which patch's version to use"
+    )
+
 class Hd2ToolPanelSettings(PropertyGroup):
     # Patches
     Patches   : EnumProperty(name="Patches", items=Patches_callback, update=ChangeActivePatch)
@@ -4280,6 +9908,7 @@ class Hd2ToolPanelSettings(PropertyGroup):
     ImportGroup0     : BoolProperty(name="Import Group 0 Only", description = "Only import the first vertex group, ignore others", default = True)
     ImportCulling    : BoolProperty(name="Import Culling Bounds", description = "Import Culling Bodies", default = False)
     ImportStatic     : BoolProperty(name="Import Static Meshes", description = "Import Static Meshes", default = False)
+    KeepFilediverObjects : BoolProperty(name="Keep Filediver Objects", description = "Keep filediver objects after Import with Shader for debugging purposes", default = False)
     MakeCollections  : BoolProperty(name="Make Collections", description = "Make new collection when importing meshes", default = False)
     Force3UVs        : BoolProperty(name="Force 3 UV Sets", description = "Force at least 3 UV sets, some materials require this", default = True)
     Force1Group      : BoolProperty(name="Force 1 Group", description = "Force mesh to only have 1 vertex group", default = True)
@@ -4309,6 +9938,9 @@ class Hd2ToolPanelSettings(PropertyGroup):
     SaveTexturesWithMaterial: BoolProperty(name="Save Textures with Material", description="Save a material\'s referenced textures to the patch when said material is saved. When disabled, new random IDs will not be given each time the material is saved", default = True)
     GenerateRandomTextureIDs: BoolProperty(name="Generate Random Texture IDs", description="Give a material\'s referenced textures new random IDs when said material is saved", default = True)
     OnlySaveCustomTextures:   BoolProperty(name="Save Only Custom Textures", description="Only save the labeled texture nodes on a SDK material preset", default = True)
+
+    # Combine Patches conflict resolution
+    combine_conflicts: CollectionProperty(type=ConflictItem)
 
     def get_settings_dict(self):
         dict = {}
@@ -4429,6 +10061,7 @@ class MY_UL_List(UIList):
             #row.label(text=friendly_name, icon = type_icon, depress=True)
             if entry_type == UnitID:
                 row.operator("helldiver2.archive_unit_save", icon='FILE_BLEND', text="").object_id = item.item_name
+                # row.operator("helldiver2.save_mesh_baked_textures", icon='RENDER_RESULT', text="")  # Disabled - not ready
                 row.operator("helldiver2.archive_unit_import", icon='IMPORT', text="").object_id = item.item_name
             elif entry_type == TexID:
                 row.operator("helldiver2.texture_saveblendimage", icon='FILE_BLEND', text="").object_id = item.item_name
@@ -4562,9 +10195,189 @@ class HellDivers2ToolsPanel(Panel):
                         op.bone_weight = weight
                         op.blend_mask_index = i
                 i -= 1
-                    
+
             # draw the values for the bone blend masks for each layer
-    
+
+    def draw_unit_editor(self, Entry, layout):
+        """Draw the Unit Editor panel showing all editable unit values"""
+        import struct
+
+        if not Entry.IsLoaded:
+            return
+
+        mesh_file = Entry.LoadedData
+        object_id = str(Entry.FileID)
+
+        # === LOD Thresholds Section ===
+        lod_data = mesh_file.UnreversedLODGroupListData
+        if lod_data and len(lod_data) >= 4:
+            row = layout.row()
+            row.label(text=f"LOD Data ({len(lod_data)} bytes)", icon='MOD_DECIM')
+
+            num_floats = len(lod_data) // 4
+            floats = struct.unpack(f'<{num_floats}f', lod_data[:num_floats * 4])
+
+            for i, f in enumerate(floats):
+                if -1e6 < f < 1e6:
+                    row = layout.row()
+                    row.separator(factor=2.0)
+
+                    indicator = ""
+                    if f == 0.0:
+                        indicator = " (always visible)"
+                    elif 0.0 < f <= 1.0:
+                        indicator = f" ({f*100:.1f}% screen)"
+
+                    split = row.split(factor=0.4)
+                    split.label(text=f"LOD[{i}]{indicator}")
+
+                    op = split.operator("helldiver2.unit_lod_value", text=f"{f:.6f}")
+                    op.object_id = object_id
+                    op.value_index = i
+                    op.value = f
+
+            row = layout.row()
+            row.separator(factor=2.0)
+            row.operator("helldiver2.make_always_visible", icon='HIDE_OFF', text="Set All to 0 (Always Visible)").object_id = object_id
+
+        layout.separator()
+
+        # === UnkHeaderData1 Section ===
+        if mesh_file.UnkHeaderData1 and len(mesh_file.UnkHeaderData1) > 0:
+            row = layout.row()
+            row.label(text=f"UnkHeaderData1 ({len(mesh_file.UnkHeaderData1)} bytes)", icon='FILE_HIDDEN')
+
+            num_floats = len(mesh_file.UnkHeaderData1) // 4
+            if num_floats > 0:
+                floats = struct.unpack(f'<{num_floats}f', mesh_file.UnkHeaderData1[:num_floats * 4])
+                for i, f in enumerate(floats[:16]):  # Limit to first 16
+                    if -1e6 < f < 1e6:
+                        row = layout.row()
+                        row.separator(factor=2.0)
+                        split = row.split(factor=0.4)
+                        split.label(text=f"Hdr1[{i}]")
+                        op = split.operator("helldiver2.unit_header_value", text=f"{f:.6f}")
+                        op.object_id = object_id
+                        op.field_name = "UnkHeaderData1"
+                        op.value_index = i
+                        op.value = f
+
+        layout.separator()
+
+        # === MeshInfo Section ===
+        if mesh_file.MeshInfoArray:
+            row = layout.row()
+            row.label(text=f"MeshInfo ({len(mesh_file.MeshInfoArray)} meshes)", icon='MESH_DATA')
+
+            for i, mesh_info in enumerate(mesh_file.MeshInfoArray):
+                # Foldout for each mesh
+                foldout_key = f"unit_mesh_{object_id}_{i}"
+                if foldout_key not in Global_Foldouts:
+                    Global_Foldouts[foldout_key] = False
+
+                row = layout.row()
+                row.separator(factor=2.0)
+                lod_label = f"LOD{mesh_info.LodIndex}" if mesh_info.LodIndex >= 0 else "Main"
+                fold_icon = "DOWNARROW_HLT" if Global_Foldouts[foldout_key] else "RIGHTARROW"
+                row.operator("helldiver2.collapse_section", text=f"Mesh {i} ({lod_label})", icon=fold_icon, emboss=False).type = foldout_key
+
+                if Global_Foldouts[foldout_key]:
+                    col = layout.column()
+
+                    # unk1 (uint64)
+                    row = col.row()
+                    row.separator(factor=4.0)
+                    split = row.split(factor=0.3)
+                    split.label(text="unk1")
+                    op = split.operator("helldiver2.unit_meshinfo_uint64", text=f"{mesh_info.unk1} (0x{mesh_info.unk1:016x})")
+                    op.object_id = object_id
+                    op.mesh_index = i
+                    op.field_name = "unk1"
+                    op.value = mesh_info.unk1
+
+                    # unk2 (32 bytes - bounding box)
+                    if len(mesh_info.unk2) == 32:
+                        floats = struct.unpack('<8f', mesh_info.unk2)
+                        row = col.row()
+                        row.separator(factor=4.0)
+                        split = row.split(factor=0.3)
+                        split.label(text="unk2 (bbox)")
+                        bbox_text = f"Min({floats[0]:.1f},{floats[1]:.1f},{floats[2]:.1f}) Max({floats[4]:.1f},{floats[5]:.1f},{floats[6]:.1f})"
+                        op = split.operator("helldiver2.unit_bbox_value", text=bbox_text)
+                        op.object_id = object_id
+                        op.mesh_index = i
+
+                    # unk3 (uint32)
+                    row = col.row()
+                    row.separator(factor=4.0)
+                    split = row.split(factor=0.3)
+                    split.label(text="unk3")
+                    op = split.operator("helldiver2.unit_meshinfo_uint32", text=f"{mesh_info.unk3} (0x{mesh_info.unk3:08x})")
+                    op.object_id = object_id
+                    op.mesh_index = i
+                    op.field_name = "unk3"
+                    op.value = mesh_info.unk3
+
+                    # unk4 (uint32)
+                    row = col.row()
+                    row.separator(factor=4.0)
+                    split = row.split(factor=0.3)
+                    split.label(text="unk4")
+                    op = split.operator("helldiver2.unit_meshinfo_uint32", text=f"{mesh_info.unk4} (0x{mesh_info.unk4:08x})")
+                    op.object_id = object_id
+                    op.mesh_index = i
+                    op.field_name = "unk4"
+                    op.value = mesh_info.unk4
+
+                    # LodIndex (int32)
+                    row = col.row()
+                    row.separator(factor=4.0)
+                    split = row.split(factor=0.3)
+                    split.label(text="LodIndex")
+                    op = split.operator("helldiver2.unit_meshinfo_int32", text=f"{mesh_info.LodIndex}")
+                    op.object_id = object_id
+                    op.mesh_index = i
+                    op.field_name = "LodIndex"
+                    op.value = mesh_info.LodIndex
+
+                    # MeshID (uint32)
+                    row = col.row()
+                    row.separator(factor=4.0)
+                    split = row.split(factor=0.3)
+                    split.label(text="MeshID")
+                    op = split.operator("helldiver2.unit_meshinfo_uint32", text=f"{mesh_info.MeshID} (0x{mesh_info.MeshID:08x})")
+                    op.object_id = object_id
+                    op.mesh_index = i
+                    op.field_name = "MeshID"
+                    op.value = mesh_info.MeshID
+
+                    # unk6 (40 bytes)
+                    if len(mesh_info.unk6) == 40:
+                        floats = struct.unpack('<10f', mesh_info.unk6)
+                        row = col.row()
+                        row.separator(factor=4.0)
+                        split = row.split(factor=0.3)
+                        split.label(text="unk6 (40B)")
+                        op = split.operator("helldiver2.unit_meshinfo_unk6", text=f"[{floats[0]:.2f}, {floats[1]:.2f}, ...]")
+                        op.object_id = object_id
+                        op.mesh_index = i
+
+                    # unk8 (uint64)
+                    row = col.row()
+                    row.separator(factor=4.0)
+                    split = row.split(factor=0.3)
+                    split.label(text="unk8")
+                    op = split.operator("helldiver2.unit_meshinfo_uint64", text=f"{mesh_info.unk8} (0x{mesh_info.unk8:016x})")
+                    op.object_id = object_id
+                    op.mesh_index = i
+                    op.field_name = "unk8"
+                    op.value = mesh_info.unk8
+
+        # Save button
+        layout.separator()
+        row = layout.row()
+        row.operator("helldiver2.save_unit_data", icon='FILE_BLEND', text="Save Unit Data").object_id = object_id
+
     def draw(self, context):
         layout = self.layout
         scene = context.scene
@@ -4619,6 +10432,7 @@ class HellDivers2ToolsPanel(Panel):
             row.prop(scene.Hd2ToolPanelSettings, "ImportStatic")
             row.prop(scene.Hd2ToolPanelSettings, "RemoveGoreMeshes")
             row.prop(scene.Hd2ToolPanelSettings, "ParentArmature")
+            row.prop(scene.Hd2ToolPanelSettings, "KeepFilediverObjects")
             row.prop(scene.Hd2ToolPanelSettings, "ImportArmature")
             row = settings_box.row(); row.separator(); row.label(text="Export Options"); box = row.box(); row = box.grid_flow(columns=1)
             row.prop(scene.Hd2ToolPanelSettings, "Force3UVs")
@@ -4653,6 +10467,14 @@ class HellDivers2ToolsPanel(Panel):
                 row.operator("helldiver2.search_by_entry", icon= 'FILEBROWSER')
                 row.operator("helldiver2.bulk_load", icon= 'IMPORT', text="Bulk Load")
                 row.operator("helldiver2.search_by_entry_input", icon= 'VIEWZOOM')
+                row = box.row()
+                row.operator("helldiver2.texture_search", icon= 'TEXTURE', text="Texture Search")
+                row.operator("helldiver2.texture_batch_opacity", icon= 'MOD_OPACITY', text="Batch Opacity")
+                row = box.row()
+                row.operator("helldiver2.fix_ninja_ripper", icon= 'ORIENTATION_GIMBAL', text="Fix Ninja Ripper Imports")
+                row.operator("helldiver2.mesh_search", icon= 'MESH_DATA', text="Mesh Search")
+                row = box.row()
+                row.operator("helldiver2.audit_unit_lod", icon= 'VIEWZOOM', text="Audit Unit LOD Values")
                 #row = box.grid_flow(columns=1)
                 #row.operator("helldiver2.meshfixtool", icon='MODIFIER')
                 search = box.row()
@@ -4662,6 +10484,11 @@ class HellDivers2ToolsPanel(Panel):
             row = settings_box.row()
             row.label(text=Global_gamepath)
             row.operator("helldiver2.change_filepath", icon='FILEBROWSER')
+            # Filediver path setting
+            row = settings_box.row()
+            filediver_label = Global_filediverpath if Global_filediverpath else "Filediver: Not Set"
+            row.label(text=filediver_label)
+            row.operator("helldiver2.change_filediverpath", icon='FILEBROWSER')
             settings_box.separator()
 
         if not Global_gamepathIsValid:
@@ -4712,6 +10539,12 @@ class HellDivers2ToolsPanel(Panel):
         #    Global_TocManager.SetActivePatchByName(scene.Hd2ToolPanelSettings.Patches)
         row.operator("helldiver2.rename_patch", icon='GREASEPENCIL', text="")
         row.operator("helldiver2.archive_import", icon= 'FILEBROWSER', text="").is_patch = True
+
+        # Patch utility buttons
+        row = layout.row()
+        row.operator("helldiver2.combine_patches", icon='AUTOMERGE_ON', text="Combine Patches")
+        row.operator("helldiver2.repatch_mod", icon='FILE_REFRESH', text="Repatch Units")
+        row.operator("helldiver2.repatch_folder", icon='FILE_FOLDER', text="Repatch Folder")
 
         # Draw Archive Contents
         
@@ -4829,6 +10662,32 @@ class HellDivers2ToolsPanel(Panel):
                     if state_machine_editor_show and mat_item: sub.operator("helldiver2.state_machine_save", icon='FILE_BLEND', text="").object_id = mat_item.item_name
                     #if material_editor_show and mat_item: sub.operator("helldiver2.material_save", icon='FILE_BLEND', text="").object_id = mat_item.item_name
                     # add operator to save state machine
+                if Type.TypeID == UnitID:
+                    # draw unit editor
+                    if "unit_editor" not in Global_Foldouts:
+                        Global_Foldouts["unit_editor"] = False
+                    unit_editor_show = Global_Foldouts["unit_editor"]
+                    row = box.box()
+                    split = row.split()
+                    fold_icon = "DOWNARROW_HLT" if unit_editor_show else "RIGHTARROW"
+                    sub = split.row(align=True)
+
+                    header_label = "Unit Editor"
+                    unit_item = None
+                    if unit_editor_show:
+                        unit_list = getattr(context.scene, f"list_{Type.TypeID}")
+                        unit_index = getattr(context.scene, f"index_{Type.TypeID}")
+                        if unit_index < len(unit_list):
+                            unit_item = unit_list[unit_index]
+                            Entry = Global_TocManager.GetEntry(int(unit_item.item_name), int(unit_item.item_type))
+                            if Entry:
+                                if not Entry.IsLoaded:
+                                    Entry.Load(True, False, True)
+                                self.draw_unit_editor(Entry, row.row().column(align=True))
+                                header_label = f"Unit Editor: {unit_item.item_name}"
+                    sub.operator("helldiver2.collapse_section", text=header_label, icon=fold_icon, emboss=False).type = "unit_editor"
+                    if unit_editor_show and unit_item:
+                        sub.operator("helldiver2.make_always_visible", icon='HIDE_OFF', text="").object_id = unit_item.item_name
                 if Type.TypeID == MaterialID:
                     # draw material editor
                     if "material_editor" not in Global_Foldouts: # move to only init this key once
@@ -4950,6 +10809,8 @@ class WM_MT_button_context(Menu):
         row.separator()
         if AreAllUnits:
             row.operator("helldiver2.archive_unit_import", icon='IMPORT', text=ImportUnitName).object_id = FileIDStr
+            if Global_filediverpathIsValid:
+                row.operator("helldiver2.import_mesh_with_shader", icon='SHADING_RENDERED', text="With Shader").object_id = FileIDStr
         elif AreAllTextures:
             row.operator("helldiver2.texture_import", icon='IMPORT', text=ImportTextureName).object_id = FileIDStr
         elif AreAllMaterials:
@@ -4972,8 +10833,13 @@ class WM_MT_button_context(Menu):
         if AreAllUnits:
             if SingleEntry:
                 row.operator("helldiver2.archive_unit_save", icon='FILE_BLEND', text="Save Unit").object_id = str(Entry.FileID)
+                # row.operator("helldiver2.save_mesh_baked_textures", icon='RENDER_RESULT', text="Bake & Save")  # Disabled - not ready
+                row.operator("helldiver2.override_all_helmets", icon='MOD_CLOTH', text="Override All Helmets").object_id = str(Entry.FileID)
+                row.operator("helldiver2.make_always_visible", icon='HIDE_OFF', text="Always Visible").object_id = str(Entry.FileID)
             else:
               row.operator("helldiver2.archive_unit_batchsave", icon='FILE_BLEND', text=f"Save {NumSelected} Units")
+              row.operator("helldiver2.make_always_visible", icon='HIDE_OFF', text=f"Always Visible ({NumSelected})").object_id = FileIDStr
+              # row.operator("helldiver2.save_mesh_baked_textures", icon='RENDER_RESULT', text="Bake & Save")  # Disabled - not ready
         elif AreAllTextures:
             row.operator("helldiver2.texture_saveblendimage", icon='FILE_BLEND', text=SaveTextureName).object_id = FileIDStr
             row.separator()
@@ -5060,7 +10926,10 @@ class WM_MT_button_context(Menu):
         # Draw import buttons
         # TODO: Add generic import buttons
         layout.separator()
-        if item_type == UnitID:       layout.operator("helldiver2.archive_unit_import", icon='IMPORT', text=f"Import {len(selected_items)} Mesh{'es' if len(selected_items) > 1 else ''}").object_id = FileIDStr
+        if item_type == UnitID:
+            layout.operator("helldiver2.archive_unit_import", icon='IMPORT', text=f"Import {len(selected_items)} Mesh{'es' if len(selected_items) > 1 else ''}").object_id = FileIDStr
+            if Global_filediverpathIsValid:
+                layout.operator("helldiver2.import_mesh_with_shader", icon='SHADING_RENDERED', text=f"Import {len(selected_items)} Mesh{'es' if len(selected_items) > 1 else ''} with Shader").object_id = FileIDStr
         elif item_type == TexID:      layout.operator("helldiver2.texture_import",      icon='IMPORT', text=f"Import {len(selected_items)} Texture{'s' if len(selected_items) > 1 else ''}").object_id = FileIDStr
         elif item_type == MaterialID: layout.operator("helldiver2.material_import",     icon='IMPORT', text=f"Import {len(selected_items)} Material{'s' if len(selected_items) > 1 else ''}").object_id = FileIDStr
         #elif AreAllParticles:
@@ -5081,8 +10950,13 @@ class WM_MT_button_context(Menu):
         if item_type == UnitID:
             if len(selected_items) == 1:
                 layout.operator("helldiver2.archive_unit_save", icon='FILE_BLEND', text="Save Mesh").object_id = list_item.item_name
+                # layout.operator("helldiver2.save_mesh_baked_textures", icon='RENDER_RESULT', text="Bake & Save")  # Disabled - not ready
+                layout.operator("helldiver2.override_all_helmets", icon='MOD_CLOTH', text="Override All Helmets").object_id = list_item.item_name
+                layout.operator("helldiver2.make_always_visible", icon='HIDE_OFF', text="Always Visible").object_id = list_item.item_name
             else:
                 layout.operator("helldiver2.archive_unit_batchsave", icon='FILE_BLEND', text=f"Save {len(selected_items)} Meshes")
+                layout.operator("helldiver2.make_always_visible", icon='HIDE_OFF', text=f"Always Visible ({len(selected_items)})").object_id = FileIDStr
+                # layout.operator("helldiver2.save_mesh_baked_textures", icon='RENDER_RESULT', text="Bake & Save")  # Disabled - not ready
         elif item_type == TexID:
             layout.operator("helldiver2.texture_saveblendimage", icon='FILE_BLEND', text=f"Save {len(selected_items)} Blender Texture{'s' if len(selected_items) > 1 else ''}").object_id = FileIDStr
             layout.separator()
@@ -5158,6 +11032,16 @@ classes = (
     PatchArchiveOperator,
     ImportStingrayUnitOperator,
     SaveStingrayUnitOperator,
+    UnitLodValueOperator,
+    UnitBboxValueOperator,
+    UnitHeaderValueOperator,
+    UnitMeshInfoUint32Operator,
+    UnitMeshInfoInt32Operator,
+    UnitMeshInfoUint64Operator,
+    UnitMeshInfoUnk6Operator,
+    MakeUnitAlwaysVisibleOperator,
+    SaveUnitDataOperator,
+    AuditUnitLodValuesOperator,
     ImportStingrayAnimationOperator,
     SaveStingrayAnimationOperator,
     ImportMaterialOperator,
@@ -5165,6 +11049,7 @@ classes = (
     ExportTextureOperator,
     DumpArchiveObjectOperator,
     ImportDumpOperator,
+    ConflictItem,
     Hd2ToolPanelSettings,
     HellDivers2ToolsPanel,
     UndoArchiveEntryModOperator,
@@ -5189,12 +11074,14 @@ classes = (
     CopyTextOperator,
     BatchExportTextureOperator,
     BatchSaveStingrayUnitOperator,
+    OverrideAllHelmetsOperator,
     SelectAllOfTypeOperator,
     RenamePatchEntryOperator,
     DuplicateEntryOperator,
     SetEntryFriendlyNameOperator,
     DefaultLoadArchiveOperator,
     BulkLoadOperator,
+    FixNinjaRipperOperator,
     ImportAllOfTypeOperator,
     UnloadPatchesOperator,
     GithubOperator,
@@ -5203,6 +11090,9 @@ classes = (
     PasteCustomPropertyOperator,
     CopyArchiveIDOperator,
     ExportPatchAsZipOperator,
+    CombinePatchesOperator,
+    RepatchModOperator,
+    RepatchFolderOperator,
     RenamePatchOperator,
     NextArchiveOperator,
     MaterialTextureEntryOperator,
@@ -5210,8 +11100,14 @@ classes = (
     SaveTextureFromPNGOperator,
     SearchByEntryIDOperator,
     ChangeSearchpathOperator,
+    ChangeFilediverPathOperator,
+    ImportMeshWithShaderOperator,
+    SaveMeshWithBakedTexturesOperator,
     ExportTexturePNGOperator,
     BatchExportTexturePNGOperator,
+    TextureSearchOperator,
+    BatchOpacityPatchOperator,
+    MeshSearchOperator,
     CopyDecimalIDOperator,
     CopyHexIDOperator,
     GenerateEntryIDOperator,
